@@ -97,6 +97,20 @@ class LineFollowingAlgorithm:
         """Düz çizgi için hareket kararı"""
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
+        # YENİ EKLENEN KONTROLLER - ÜST BÖLGE KONTROLÜ
+        # Eğer çizgi sadece sol üstte varsa sol yengeç yap
+        if sol_ust > 1000 and orta_ust <= 1000 and sag_ust <= 1000:
+            return "SOL YENGEC"
+
+        # Eğer çizgi sadece sağ üstte varsa sağ yengeç yap
+        elif sag_ust > 1000 and orta_ust <= 1000 and sol_ust <= 1000:
+            return "SAG YENGEC"
+
+        # Eğer çizgi sadece orta üstte varsa düz git
+        elif orta_ust > 1000 and sol_ust <= 1000 and sag_ust <= 1000:
+            return "DUZ GIT"
+
+        # MEVCUT MANTIK - HİÇ DEĞİŞTİRİLMEDİ
         # Orta alt + Orta üst = DÜZ GİT
         if orta_alt > 1000 and orta_ust > 1000:
             return "DUZ GIT"
@@ -202,7 +216,7 @@ class LineFollowingAlgorithm:
 if __name__ == "__main__":
     try:
         # Video dosyası yolunu buraya yazın
-        video_path = "C:/Users/user/Downloads/video1.mp4"  # Kendi video dosyanızın yolunu yazın
+        video_path = "C:/Users/user/Downloads/video2.mp4"  # Kendi video dosyanızın yolunu yazın
         #video_path =1
         # Kamera için None bırakın, video için dosya yolunu verin
         algorithm = LineFollowingAlgorithm(video_path)  # Video için
