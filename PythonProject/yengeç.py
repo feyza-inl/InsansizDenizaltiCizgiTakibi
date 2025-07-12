@@ -216,7 +216,7 @@ class LineFollowingAlgorithm:
 if __name__ == "__main__":
     try:
         # Video dosyası yolunu buraya yazın
-        video_path = "C:/Users/user/Downloads/video2.mp4"  # Kendi video dosyanızın yolunu yazın
+        video_path = "C:/Users/user/Downloads/video6.mp4"  # Kendi video dosyanızın yolunu yazın
         #video_path =1
         # Kamera için None bırakın, video için dosya yolunu verin
         algorithm = LineFollowingAlgorithm(video_path)  # Video için
