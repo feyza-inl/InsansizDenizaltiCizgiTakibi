@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import math
+import time
 
 
 class LineFollowingAlgorithm:
@@ -8,96 +9,111 @@ class LineFollowingAlgorithm:
         if video_path:
             self.cap = cv2.VideoCapture(video_path)
         else:
+            # Kamera ayarlarını optimize et
             self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Düşük çözünürlük
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)  # FPS ayarı
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Buffer boyutunu azalt
 
         # Video boyutlarını al
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Ekranı 6 bölgeye ayırma (3 dikey x 2 yatay)
-        self.region_width = self.width // 3
-        self.region_height = int(self.height * 0.6)
+        # İşleme için küçültülmüş boyutlar
+        self.process_width = 320  # İşleme boyutu
+        self.scale_factor = self.width / self.process_width
+
+        # Bölge ayarları (küçültülmüş boyuta göre)
+        self.region_width = self.process_width // 3
+        self.region_height = int(self.height * 0.6 / self.scale_factor)
 
         # Çizgi rengi eşiği (siyah çizgi için)
         self.lower_threshold = 0
         self.upper_threshold = 50
 
-        # *** YENİ: AÇI KONTROL PARAMETRELERİ ***
+        # AÇI KONTROL PARAMETRELERİ
         self.max_allowed_angle = 20  # Kabul edilebilir maksimum açı (derece)
-        self.min_line_length = 50  # Açı hesaplama için minimum çizgi uzunluğu
+        self.min_line_length = 30  # Daha kısa çizgiler için (optimize)
         self.angle_correction_threshold = 10  # Bu açıdan fazlası düzeltme gerektirir
 
-    def detect_line_angle(self, frame):
-        """Çizginin açısını HoughLinesP ile tespit eder"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, self.upper_threshold, 255, cv2.THRESH_BINARY_INV)
+        # FPS hesaplama
+        self.prev_time = time.time()
+        self.fps = 0
 
-        # HoughLinesP ile çizgileri tespit et
-        lines = cv2.HoughLinesP(thresh, 1, np.pi / 180, threshold=50,
-                                minLineLength=self.min_line_length, maxLineGap=10)
+    def preprocess_frame(self, frame):
+        """Görüntüyü küçült ve ön işleme yap"""
+        # Boyutu küçült
+        small_frame = cv2.resize(frame, (self.process_width, int(self.height / self.scale_factor)))
+        # Gri tonlama
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        # Threshold
+        _, thresh = cv2.threshold(gray, self.upper_threshold, 255, cv2.THRESH_BINARY_INV)
+        # Gürültü azaltma
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        return gray, thresh, small_frame
+
+    def detect_line_angle(self, gray_frame):
+        """Optimize edilmiş çizgi açısı tespiti"""
+        # HoughLinesP parametreleri optimize edildi
+        lines = cv2.HoughLinesP(gray_frame, 1, np.pi / 180,
+                                threshold=30,  # Daha düşük eşik
+                                minLineLength=self.min_line_length,
+                                maxLineGap=20)  # Daha büyük boşluk
 
         if lines is not None:
-            # En uzun çizgiyi bul
-            longest_line = None
-            max_length = 0
+            # En uzun 2 çizgiyi al
+            lines = sorted(lines, key=lambda x: np.linalg.norm(x[0][2:] - x[0][:2]), reverse=True)[:2]
+
+            angles = []
+            centers = []
+            valid_lines = []
 
             for line in lines:
                 x1, y1, x2, y2 = line[0]
                 length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-                if length > max_length:
-                    max_length = length
-                    longest_line = line[0]
 
-            if longest_line is not None:
-                x1, y1, x2, y2 = longest_line
+                if length > self.min_line_length:
+                    angle = math.degrees(math.atan2(x2 - x1, y2 - y1))
+                    # Açı normalizasyonu
+                    if angle > 90:
+                        angle -= 180
+                    elif angle < -90:
+                        angle += 180
 
-                # Çizginin açısını hesapla (dikey eksene göre)
-                angle = math.degrees(math.atan2(x2 - x1, y2 - y1))
+                    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    angles.append(angle)
+                    centers.append(center)
+                    valid_lines.append(line[0])
 
-                # Açıyı -90 ile +90 arasında normalize et
-                if angle > 90:
-                    angle = angle - 180
-                elif angle < -90:
-                    angle = angle + 180
-
-                # Çizginin orta noktasını bul
-                center_x = (x1 + x2) // 2
-                center_y = (y1 + y2) // 2
-
-                return angle, (center_x, center_y), longest_line
+            if angles:
+                # Ortalama açı ve merkez
+                avg_angle = np.mean(angles)
+                avg_center = (int(np.mean([c[0] for c in centers])),
+                              int(np.mean([c[1] for c in centers])))
+                return avg_angle, avg_center, valid_lines
 
         return None, None, None
 
-    def detect_line_position(self, frame):
-        """Çizginin hangi bölgede olduğunu tespit eder - 6 bölge"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, self.upper_threshold, 255, cv2.THRESH_BINARY_INV)
-
-        # ÜST YARIM
+    def detect_line_position(self, thresh):
+        """Optimize edilmiş bölge tespiti"""
+        # Üst ve alt bölgeler
         upper_half = thresh[0:self.region_height, :]
-        # ALT YARIM
         lower_half = thresh[self.region_height:, :]
 
-        # Üst yarım için bölge analizi
-        upper_regions = []
-        for i in range(3):
-            start_x = i * self.region_width
-            end_x = (i + 1) * self.region_width
-            region = upper_half[:, start_x:end_x]
-            white_pixels = np.sum(region == 255)
-            upper_regions.append(white_pixels)
+        # Hızlı bölge analizi
+        upper_regions = [
+            np.count_nonzero(upper_half[:, i * self.region_width:(i + 1) * self.region_width])
+            for i in range(3)
+        ]
 
-        # Alt yarım için bölge analizi
-        lower_regions = []
-        for i in range(3):
-            start_x = i * self.region_width
-            end_x = (i + 1) * self.region_width
-            region = lower_half[:, start_x:end_x]
-            white_pixels = np.sum(region == 255)
-            lower_regions.append(white_pixels)
+        lower_regions = [
+            np.count_nonzero(lower_half[:, i * self.region_width:(i + 1) * self.region_width])
+            for i in range(3)
+        ]
 
-        all_regions = upper_regions + lower_regions
-        return all_regions, thresh
+        return upper_regions + lower_regions, thresh
 
     def is_line_angled(self, angle):
         """Çizginin açılı olup olmadığını kontrol eder"""
@@ -134,11 +150,10 @@ class LineFollowingAlgorithm:
             return "VIRAJ TESPIT EDILEMEDI"
 
     def duz_cizgi_fonksiyonu(self, regions, angle=None, line_center=None):
-        """*** GELİŞTİRİLMİŞ: Açı kontrolü eklenmiş düz çizgi fonksiyonu ***"""
+        """Açı kontrolü eklenmiş düz çizgi fonksiyonu"""
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
-        # *** YENİ: AÇI KONTROL BLOĞU ***
-        # Eğer çizgi orta bölgelerde var ama açılıysa düzeltme yap
+        # AÇI KONTROL BLOĞU
         if orta_alt > 1000 and orta_ust > 1000:
             if self.is_line_angled(angle):
                 if angle < -self.angle_correction_threshold:
@@ -148,7 +163,7 @@ class LineFollowingAlgorithm:
             else:
                 return "DUZ GIT"  # Çizgi düz, normal ilerle
 
-        # MEVCUT ÜST BÖLGE KONTROLÜ
+        # ÜST BÖLGE KONTROLÜ
         if sol_ust > 1000 and orta_ust <= 1000 and sag_ust <= 1000:
             return "SOL YENGEC"
         elif sag_ust > 1000 and orta_ust <= 1000 and sol_ust <= 1000:
@@ -173,49 +188,47 @@ class LineFollowingAlgorithm:
 
     def draw_regions(self, frame):
         """Bölgeleri ve çizgileri görsel olarak çiz"""
-        # Bölge çizgileri
-        cv2.line(frame, (self.region_width, 0), (self.region_width, self.height), (0, 255, 0), 2)
-        cv2.line(frame, (2 * self.region_width, 0), (2 * self.region_width, self.height), (0, 255, 0), 2)
-        cv2.line(frame, (0, self.region_height), (self.width, self.region_height), (0, 255, 0), 2)
+        # Bölge çizgileri (orijinal boyutta)
+        rw = int(self.region_width * self.scale_factor)
+        rh = int(self.region_height * self.scale_factor)
+        cv2.line(frame, (rw, 0), (rw, self.height), (0, 255, 0), 2)
+        cv2.line(frame, (rw * 2, 0), (rw * 2, self.height), (0, 255, 0), 2)
+        cv2.line(frame, (0, rh), (self.width, rh), (0, 255, 0), 2)
 
-        # *** YENİ: Merkez çizgisi ***
+        # Merkez çizgisi
         cv2.line(frame, (self.width // 2, 0), (self.width // 2, self.height), (255, 0, 0), 1)
 
         # Bölge etiketleri
         cv2.putText(frame, "SOL UST", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "ORTA UST", (self.region_width + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "SAG UST", (2 * self.region_width + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
-                    1)
+        cv2.putText(frame, "ORTA UST", (rw + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "SAG UST", (rw * 2 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         cv2.putText(frame, "SOL ALT", (10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "ORTA ALT", (self.region_width + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (255, 255, 255), 1)
-        cv2.putText(frame, "SAG ALT", (2 * self.region_width + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (255, 255, 255), 1)
+        cv2.putText(frame, "ORTA ALT", (rw + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "SAG ALT", (rw * 2 + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
+                    1)
 
         return frame
 
-    def draw_detected_line(self, frame, line, center, angle):
-        """*** YENİ: Tespit edilen çizgiyi ve bilgilerini çiz ***"""
-        if line is not None:
-            x1, y1, x2, y2 = line
-            # Ana çizgiyi kırmızı renkte çiz
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+    def draw_detected_line(self, frame, lines, center, angle):
+        """Tespit edilen çizgiyi ve bilgilerini çiz"""
+        if lines:
+            for line in lines:
+                x1, y1, x2, y2 = [int(x * self.scale_factor) for x in line]
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
-            if center is not None:
-                # Merkez noktasını yeşil daire ile işaretle
-                cv2.circle(frame, center, 5, (0, 255, 0), -1)
-
-                # Merkez noktasından dikey çizgi çiz (referans için)
-                cv2.line(frame, (center[0], center[1] - 20), (center[0], center[1] + 20), (0, 255, 0), 2)
+            if center:
+                cx, cy = [int(c * self.scale_factor) for c in center]
+                cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+                cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 2)
 
         return frame
 
     def run(self):
         """Ana döngü"""
-        print("*** GELİŞTİRİLMİŞ Çizgi takibi başlatılıyor ***")
+        print("*** OPTİMİZE ÇİZGİ TAKİBİ BAŞLATILDI ***")
         print("Çıkmak için 'q' tuşuna basın")
-        print("Video hızını ayarlamak için 'SPACE' ile duraklat/devam et")
+        print("Duraklatmak için 'SPACE' tuşuna basın")
 
         paused = False
 
@@ -226,50 +239,56 @@ class LineFollowingAlgorithm:
                     print("Video bitti veya okuma hatası!")
                     break
 
-            # *** YENİ: Çizgi açısını tespit et ***
-            angle, line_center, detected_line = self.detect_line_angle(frame)
+                # FPS hesaplama
+                curr_time = time.time()
+                self.fps = 1 / (curr_time - self.prev_time)
+                self.prev_time = curr_time
 
-            # Çizgi pozisyonunu tespit et (6 bölge)
-            regions, thresh = self.detect_line_position(frame)
+                # Ön işleme
+                gray, thresh, small_frame = self.preprocess_frame(frame)
 
-            # Viraj var mı kontrol et
-            is_viraj = self.viraj_tespiti(regions)
+                # Çizgi tespiti
+                angle, center, lines = self.detect_line_angle(thresh)
+                regions, _ = self.detect_line_position(thresh)
 
-            # *** GELİŞTİRİLMİŞ: Açı bilgisi ile hareket kararı ver ***
-            if is_viraj:
-                hareket = self.viraj_fonksiyonu(regions)
-                mod = "VIRAJ MODU"
-            else:
-                hareket = self.duz_cizgi_fonksiyonu(regions, angle, line_center)
-                mod = "DUZ CIZGI MODU"
+                # Viraj kontrolü
+                is_viraj = self.viraj_tespiti(regions)
 
-            # Görselleştirme
-            frame = self.draw_regions(frame)
-            frame = self.draw_detected_line(frame, detected_line, line_center, angle)
+                # Hareket kararı
+                if is_viraj:
+                    hareket = self.viraj_fonksiyonu(regions)
+                    mod = "VIRAJ MODU"
+                else:
+                    hareket = self.duz_cizgi_fonksiyonu(regions, angle, center)
+                    mod = "DUZ CIZGI MODU"
 
-            # Bilgileri formatla
-            sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-            bolge_bilgisi = f"U:[{sol_ust}, {orta_ust}, {sag_ust}] A:[{sol_alt}, {orta_alt}, {sag_alt}]"
+                # Görselleştirme
+                frame = self.draw_regions(frame)
+                frame = self.draw_detected_line(frame, lines, center, angle)
 
-            # *** GELİŞTİRİLMİŞ: Açı bilgisini de göster ***
-            aci_bilgisi = f"Açı: {angle:.1f}°" if angle is not None else "Açı: Tespit edilemedi"
+                # Bilgileri formatla
+                sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+                bolge_bilgisi = f"U:[{sol_ust}, {orta_ust}, {sag_ust}] A:[{sol_alt}, {orta_alt}, {sag_alt}]"
+                aci_bilgisi = f"Açı: {angle:.1f}°" if angle is not None else "Açı: Tespit edilemedi"
 
-            # Ekrana yazdır
-            cv2.putText(frame, f"Mod: {mod}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(frame, f"Hareket: {hareket}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.putText(frame, aci_bilgisi, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-            cv2.putText(frame, bolge_bilgisi, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                # Ekrana yazdır
+                cv2.putText(frame, f"FPS: {self.fps:.1f}", (self.width - 100, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(frame, f"Mod: {mod}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, f"Hareket: {hareket}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(frame, aci_bilgisi, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                cv2.putText(frame, bolge_bilgisi, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-            if paused:
-                cv2.putText(frame, "DURAKLATILDI - SPACE ile devam et", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 255, 255), 2)
+                if paused:
+                    cv2.putText(frame, "DURAKLATILDI - SPACE ile devam et", (10, 180),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            # Görüntüleri göster
-            cv2.imshow('Geliştirilmiş Cizgi Takibi', frame)
-            cv2.imshow('Threshold', thresh)
+                # Görüntüleri göster
+                cv2.imshow('Optimize Cizgi Takibi', frame)
+                cv2.imshow('Threshold', cv2.resize(thresh, (320, 240)))
 
             # Tuş kontrolü
-            key = cv2.waitKey(30) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord(' '):
@@ -284,7 +303,7 @@ class LineFollowingAlgorithm:
 if __name__ == "__main__":
     try:
         # Video dosyası yolunu buraya yazın
-        video_path = "C:/Users/user/Downloads/video3.mp4"
+        video_path = None
 
         algorithm = LineFollowingAlgorithm(video_path)
         algorithm.run()
