@@ -47,6 +47,11 @@ class LineFollowingAlgorithm:
         self.kayip_esigi = 3  # Kaç frame çizgi görülmezse arama moduna geçsin
         self.minimum_pixel_esigi = 500  # Çizgi var sayılması için minimum pixel sayısı
 
+        # *** YENİ EKLENEN: ÜÇLÜ DURUM PARAMETRELERİ ***
+        self.son_viraj_yonu = None  # "SAG" veya "SOL"
+        self.uclu_durum_counter = 0  # Üçlü durumda kaç frame
+        self.uclu_esigi = 3  # Kaç frame üçlü durumda kalırsa takibe başla
+
     # YENİ EKLENEN: ÇİZGİ VAR MI KONTROLÜ
     def cizgi_var_mi(self, regions):
         """Çizgi var mı yok mu kontrol et"""
@@ -78,6 +83,35 @@ class LineFollowingAlgorithm:
             return "SAG ARAMA"  # Sağa doğru salyangoz hareketi
         else:
             return "ORTA ARAMA"  # Orta bölgede kaybolmuşsa hafif zigzag
+
+    # *** YENİ EKLENEN: ÜÇLÜ DURUM FONKSİYONLARI ***
+    def uclu_durum_tespiti(self, regions):
+        """Üç alt bölge de doluysa True döner"""
+        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+
+        # Üç alt bölge de minimum eşiği aşıyorsa
+        uclu_var = (sol_alt > 500 and
+                    orta_alt > 500 and
+                    sag_alt > 500)
+
+        return uclu_var
+
+    def uclu_durum_algoritması(self, regions):
+        """Son viraj yönüne göre devam et"""
+        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+
+        # AMAÇ: Son viraj yönünde hafif devam ederek çizgiyi takip et
+
+        if self.son_viraj_yonu == "SAG":
+            # Sağ virajdan geldiyse → Hafif SAĞA devam et
+            return "HAFIF SAGA DON (UCLU VAR)"
+
+        elif self.son_viraj_yonu == "SOL":
+            # Sol virajdan geldiyse → Hafif SOLA devam et
+            return "HAFIF SOLA DON (UCLU VAR)"
+
+        else:
+             return " " # bisey yazmana gerek yok kubra
 
     def preprocess_frame(self, frame):
         """Görüntüyü küçült ve ön işleme yap"""
@@ -177,12 +211,14 @@ class LineFollowingAlgorithm:
         return False
 
     def viraj_fonksiyonu(self, regions):
-        """Viraj tespiti ve hareket kararı"""
+        """Viraj tespiti ve hareket kararı + SON VİRAJ HAFIZASI"""
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
         if orta_alt > 1000 and sag_alt > 1000:
+            self.son_viraj_yonu = "SAG"  # *** HAFIZA GÜNCELLE ***
             return "SAGA DON"
         elif orta_alt > 1000 and sol_alt > 1000:
+            self.son_viraj_yonu = "SOL"  # *** HAFIZA GÜNCELLE ***
             return "SOLA DON"
         else:
             return "VIRAJ TESPIT EDILEMEDI"
@@ -263,8 +299,8 @@ class LineFollowingAlgorithm:
         return frame
 
     def run(self):
-        """Ana döngü - ARAMA MODU EKLENDİ"""
-        print("*** OPTİMİZE ÇİZGİ TAKİBİ BAŞLATILDI (ARAMA MODLU) ***")
+        """Ana döngü - ÜÇLÜ DURUM DAHİL"""
+        print("*** ÜÇLÜ DURUM DAHİL - ÇİZGİ TAKİBİ V2 ***")
         print("Çıkmak için 'q' tuşuna basın")
         print("Duraklatmak için 'SPACE' tuşuna basın")
         print("Arama modunu sıfırlamak için 'r' tuşuna basın")
@@ -293,25 +329,45 @@ class LineFollowingAlgorithm:
                 # YENİ EKLENEN: ÇİZGİ VAR MI KONTROLÜ
                 cizgi_mevcut = self.cizgi_var_mi(regions)
 
-                # YENİ EKLENEN: ARAMA MODU KONTROLÜ
+                # *** YENİ: ÜÇLÜ DURUM KONTROLÜ ***
+                uclu_var = self.uclu_durum_tespiti(regions)
+
+                # YENİ EKLENEN: ARAMA MODU KONTROLÜ + ÜÇLÜ DURUM
                 if cizgi_mevcut:
                     # Çizgi varsa normal işlem
                     self.cizgi_kayip_sayaci = 0  # Sayacı sıfırla
                     self.son_cizgi_yonunu_guncelle(regions)  # Son yönü güncelle
 
-                    # Viraj kontrolü
-                    is_viraj = self.viraj_tespiti(regions)
+                    # *** ÜÇLÜ DURUM KONTROLÜ ***
+                    if uclu_var:
+                        self.uclu_durum_counter += 1
 
-                    # Hareket kararı ver
-                    if is_viraj:
-                        hareket = self.viraj_fonksiyonu(regions)
-                        mod = "VIRAJ MODU"
+                        # Birkaç frame üçlü durumda kalırsa takibe başla
+                        if self.uclu_durum_counter >= self.uclu_esigi:
+                            hareket, mod = self.uclu_durum_algoritması(regions)
+                        else:
+                            # Henüz erken, bekle
+                            hareket = "BEKLE (UCLU)"
+                            mod = "BEKLE MODU"
                     else:
-                        hareket = self.duz_cizgi_fonksiyonu(regions, angle, center)
-                        mod = "DUZ CIZGI MODU"
+                        # Üçlü durum bittiğinde sayacı sıfırla
+                        self.uclu_durum_counter = 0
+
+                        # Normal viraj kontrolü
+                        is_viraj = self.viraj_tespiti(regions)
+
+                        # Hareket kararı ver
+                        if is_viraj:
+                            hareket = self.viraj_fonksiyonu(regions)
+                            mod = "VIRAJ MODU"
+                        else:
+                            hareket = self.duz_cizgi_fonksiyonu(regions, angle, center)
+                            mod = "DUZ CIZGI MODU"
                 else:
                     # Çizgi yoksa arama moduna geç
                     self.cizgi_kayip_sayaci += 1
+                    # Üçlü durum sayacını sıfırla
+                    self.uclu_durum_counter = 0
 
                     if self.cizgi_kayip_sayaci >= self.kayip_esigi:
                         hareket = self.arama_modu_karar()
@@ -345,16 +401,28 @@ class LineFollowingAlgorithm:
                 cv2.putText(frame, f"Cizgi Mevcut: {'EVET' if cizgi_mevcut else 'HAYIR'}", (10, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if cizgi_mevcut else (0, 0, 255), 1)
 
+                # *** YENİ: ÜÇLÜ DURUM BİLGİLERİ ***
+                if uclu_var:
+                    cv2.putText(frame, f"UCLU DURUM! Counter: {self.uclu_durum_counter}",
+                                (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+
+                cv2.putText(frame, f"Son Viraj: {self.son_viraj_yonu}",
+                            (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
                 if paused:
-                    cv2.putText(frame, "DURAKLATILDI - SPACE ile devam et", (10, 270),
+                    cv2.putText(frame, "DURAKLATILDI - SPACE ile devam et", (10, 330),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                # Arama modundaysa kırmızı çerçeve çiz
+                # Mod çerçeveleri
                 if mod == "ARAMA MODU":
                     cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (0, 0, 255), 5)
+                elif mod == "TAKIP MODU":  # *** YENİ: TAKIP MODU ÇERÇEVE ***
+                    cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 255, 0), 5)
+                elif mod == "VIRAJ MODU":
+                    cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 0, 0), 5)
 
                 # Görüntüleri göster
-                cv2.imshow('Optimize Cizgi Takibi (Arama Modlu)', frame)
+                cv2.imshow('UCLU DURUM DAHİL - Cizgi Takibi V2', frame)
                 cv2.imshow('Threshold', cv2.resize(thresh, (320, 240)))
 
             # Tuş kontrolü
@@ -367,7 +435,10 @@ class LineFollowingAlgorithm:
             elif key == ord('r'):  # YENİ EKLENEN: ARAMA MODU SIFIRLAMA
                 self.cizgi_kayip_sayaci = 0
                 self.son_cizgi_yonu = "ORTA"
-                print("Arama modu sıfırlandı")
+                # *** YENİ: ÜÇLÜ DURUM SIFIRLAMA ***
+                self.son_viraj_yonu = None
+                self.uclu_durum_counter = 0
+                print("Sistem sıfırlandı")
 
         # Temizlik
         self.cap.release()
