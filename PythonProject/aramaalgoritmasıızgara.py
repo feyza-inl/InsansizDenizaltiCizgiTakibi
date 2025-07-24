@@ -24,9 +24,15 @@ class LineFollowingAlgorithm:
         self.process_width = 320  # İşleme boyutu
         self.scale_factor = self.width / self.process_width
 
-        # Bölge ayarları (küçültülmüş boyuta göre)
-        self.region_width = self.process_width // 3
-        self.region_height = int(self.height * 0.6 / self.scale_factor)
+        # YENİ: ÖZELLEŞTİRİLMİŞ BÖLGE GENİŞLİKLERİ (Ortası dar, yanları geniş)
+        self.region_ratio = [0.33, 0.34, 0.33]  # Sol, Orta, Sağ oranları
+        self.region_widths = [
+            int(self.process_width * self.region_ratio[0]),  # Sol genişlik
+            int(self.process_width * self.region_ratio[1]),  # Orta genişlik
+            int(self.process_width * self.region_ratio[2])  # Sağ genişlik
+        ]
+
+        self.region_height = int(self.height * 0.6 / self.scale_factor)  # Bölge yüksekliği
 
         # Çizgi rengi eşiği (siyah çizgi için)
         self.lower_threshold = 0
@@ -35,29 +41,27 @@ class LineFollowingAlgorithm:
         # AÇI KONTROL PARAMETRELERİ
         self.max_allowed_angle = 20  # Kabul edilebilir maksimum açı (derece)
         self.min_line_length = 30  # Daha kısa çizgiler için (optimize)
-        self.angle_correction_threshold = 10  # Bu açıdan fazlası düzeltme gerektirir
+        self.angle_correction_threshold = 20  # Bu açıdan fazlası düzeltme gerektirir
 
         # FPS hesaplama
         self.prev_time = time.time()
         self.fps = 0
 
-        # YENİ EKLENEN: ARAMA MODU PARAMETRELERİ
+        # ARAMA MODU PARAMETRELERİ
         self.son_cizgi_yonu = "ORTA"  # Son görülen çizginin yönü
         self.cizgi_kayip_sayaci = 0  # Çizgi kaybı sayacı
         self.kayip_esigi = 3  # Kaç frame çizgi görülmezse arama moduna geçsin
         self.minimum_pixel_esigi = 500  # Çizgi var sayılması için minimum pixel sayısı
 
-        # *** YENİ EKLENEN: ÜÇLÜ DURUM PARAMETRELERİ ***
+        # ÜÇLÜ DURUM PARAMETRELERİ
         self.son_viraj_yonu = None  # "SAG" veya "SOL"
         self.uclu_durum_counter = 0  # Üçlü durumda kaç frame
         self.uclu_esigi = 3  # Kaç frame üçlü durumda kalırsa takibe başla
 
-    # YENİ EKLENEN: ÇİZGİ VAR MI KONTROLÜ
     def cizgi_var_mi(self, regions):
         """Çizgi var mı yok mu kontrol et"""
         return any(region > self.minimum_pixel_esigi for region in regions)
 
-    # YENİ EKLENEN: SON ÇİZGİ YÖNÜNÜ GÜNCELLE
     def son_cizgi_yonunu_guncelle(self, regions):
         """Son görülen çizginin yönünü güncelle"""
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
@@ -74,7 +78,6 @@ class LineFollowingAlgorithm:
         elif max_index in [2, 5]:  # Sağ üst veya sağ alt
             self.son_cizgi_yonu = "SAG"
 
-    # YENİ EKLENEN: ARAMA MODU KARAR FONKSİYONU
     def arama_modu_karar(self):
         """Arama modunda hangi yöne gidileceğini belirle"""
         if self.son_cizgi_yonu == "SOL":
@@ -84,34 +87,19 @@ class LineFollowingAlgorithm:
         else:
             return "ORTA ARAMA"  # Orta bölgede kaybolmuşsa hafif zigzag
 
-    # *** YENİ EKLENEN: ÜÇLÜ DURUM FONKSİYONLARI ***
     def uclu_durum_tespiti(self, regions):
         """Üç alt bölge de doluysa True döner"""
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-
-        # Üç alt bölge de minimum eşiği aşıyorsa
-        uclu_var = (sol_alt > 500 and
-                    orta_alt > 500 and
-                    sag_alt > 500)
-
-        return uclu_var
+        return (sol_alt > 500 and orta_alt > 500 and sag_alt > 500)
 
     def uclu_durum_algoritması(self, regions):
         """Son viraj yönüne göre devam et"""
-        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-
-        # AMAÇ: Son viraj yönünde hafif devam ederek çizgiyi takip et
-
         if self.son_viraj_yonu == "SAG":
-            # Sağ virajdan geldiyse → Hafif SAĞA devam et
-            return "HAFIF SAGA DON (UCLU VAR)"
-
+            return "HAFIF SAGA DON (UCLU VAR)", "UCLU TAKIP MODU"
         elif self.son_viraj_yonu == "SOL":
-            # Sol virajdan geldiyse → Hafif SOLA devam et
-            return "HAFIF SOLA DON (UCLU VAR)"
-
+            return "HAFIF SOLA DON (UCLU VAR)", "UCLU TAKIP MODU"
         else:
-             return " " # bisey yazmana gerek yok kubra
+            return "DUZ GIT (UCLU VAR)", "UCLU TAKIP MODU"
 
     def preprocess_frame(self, frame):
         """Görüntüyü küçült ve ön işleme yap"""
@@ -128,11 +116,10 @@ class LineFollowingAlgorithm:
 
     def detect_line_angle(self, gray_frame):
         """Optimize edilmiş çizgi açısı tespiti"""
-        # HoughLinesP parametreleri optimize edildi
         lines = cv2.HoughLinesP(gray_frame, 1, np.pi / 180,
-                                threshold=30,  # Daha düşük eşik
+                                threshold=30,
                                 minLineLength=self.min_line_length,
-                                maxLineGap=20)  # Daha büyük boşluk
+                                maxLineGap=20)
 
         if lines is not None:
             # En uzun 2 çizgiyi al
@@ -169,20 +156,24 @@ class LineFollowingAlgorithm:
         return None, None, None
 
     def detect_line_position(self, thresh):
-        """Optimize edilmiş bölge tespiti"""
+        """Optimize edilmiş bölge tespiti - Yeni bölge genişlikleriyle"""
         # Üst ve alt bölgeler
         upper_half = thresh[0:self.region_height, :]
         lower_half = thresh[self.region_height:, :]
 
-        # Hızlı bölge analizi
+        # Yeni bölge sınırlarını hesapla
         upper_regions = [
-            np.count_nonzero(upper_half[:, i * self.region_width:(i + 1) * self.region_width])
-            for i in range(3)
+            np.count_nonzero(upper_half[:, 0:self.region_widths[0]]),  # Sol üst
+            np.count_nonzero(upper_half[:, self.region_widths[0]:self.region_widths[0] + self.region_widths[1]]),
+            # Orta üst
+            np.count_nonzero(upper_half[:, self.region_widths[0] + self.region_widths[1]:])  # Sağ üst
         ]
 
         lower_regions = [
-            np.count_nonzero(lower_half[:, i * self.region_width:(i + 1) * self.region_width])
-            for i in range(3)
+            np.count_nonzero(lower_half[:, 0:self.region_widths[0]]),  # Sol alt
+            np.count_nonzero(lower_half[:, self.region_widths[0]:self.region_widths[0] + self.region_widths[1]]),
+            # Orta alt
+            np.count_nonzero(lower_half[:, self.region_widths[0] + self.region_widths[1]:])  # Sağ alt
         ]
 
         return upper_regions + lower_regions, thresh
@@ -215,13 +206,13 @@ class LineFollowingAlgorithm:
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
         if orta_alt > 1000 and sag_alt > 1000:
-            self.son_viraj_yonu = "SAG"  # *** HAFIZA GÜNCELLE ***
-            return "SAGA DON"
+            self.son_viraj_yonu = "SAG"  # HAFIZA GÜNCELLE
+            return "SAGA DON", "VIRAJ MODU"
         elif orta_alt > 1000 and sol_alt > 1000:
-            self.son_viraj_yonu = "SOL"  # *** HAFIZA GÜNCELLE ***
-            return "SOLA DON"
+            self.son_viraj_yonu = "SOL"  # HAFIZA GÜNCELLE
+            return "SOLA DON", "VIRAJ MODU"
         else:
-            return "VIRAJ TESPIT EDILEMEDI"
+            return "VIRAJ TESPIT EDILEMEDI", "BEKLE MODU"
 
     def duz_cizgi_fonksiyonu(self, regions, angle=None, line_center=None):
         """Açı kontrolü eklenmiş düz çizgi fonksiyonu"""
@@ -231,55 +222,59 @@ class LineFollowingAlgorithm:
         if orta_alt > 1000 and orta_ust > 1000:
             if self.is_line_angled(angle):
                 if angle < -self.angle_correction_threshold:
-                    return "SAGA DON (AÇI DÜZELTMESİ)"  # Çizgi sağa eğik, sola dön
+                    return "SAGA DON (AÇI DÜZELTMESİ)", "DUZ CIZGI MODU"
                 elif angle > self.angle_correction_threshold:
-                    return "SOLA DON (AÇI DÜZELTMESİ)"  # Çizgi sola eğik, sağa dön
+                    return "SOLA DON (AÇI DÜZELTMESİ)", "DUZ CIZGI MODU"
             else:
-                return "DUZ GIT"  # Çizgi düz, normal ilerle
+                return "DUZ GIT", "DUZ CIZGI MODU"
 
         # ÜST BÖLGE KONTROLÜ
         if sol_ust > 1000 and orta_ust <= 1000 and sag_ust <= 1000:
-            return "SOL YENGEC"
+            return "SOL YENGEC", "DUZ CIZGI MODU"
         elif sag_ust > 1000 and orta_ust <= 1000 and sol_ust <= 1000:
-            return "SAG YENGEC"
+            return "SAG YENGEC", "DUZ CIZGI MODU"
         elif orta_ust > 1000 and sol_ust <= 1000 and sag_ust <= 1000:
-            return "DUZ GIT"
+            return "DUZ GIT", "DUZ CIZGI MODU"
 
         # MEVCUT MANTIK - Orta alt + Orta üst = DÜZ GİT
         if orta_alt > 1000 and orta_ust > 1000:
-            return "DUZ GIT"
+            return "DUZ GIT", "DUZ CIZGI MODU"
 
         # Sadece alt bölgelere bak
         lower_regions = [sol_alt, orta_alt, sag_alt]
         max_index = np.argmax(lower_regions)
 
         if max_index == 0:
-            return "SOL YENGEC"
+            return "SOL YENGEC", "DUZ CIZGI MODU"
         elif max_index == 1:
-            return "DUZ GIT"
+            return "DUZ GIT", "DUZ CIZGI MODU"
         else:
-            return "SAG YENGEC"
+            return "SAG YENGEC", "DUZ CIZGI MODU"
 
     def draw_regions(self, frame):
-        """Bölgeleri ve çizgileri görsel olarak çiz"""
-        # Bölge çizgileri (orijinal boyutta)
-        rw = int(self.region_width * self.scale_factor)
+        """Bölgeleri ve çizgileri görsel olarak çiz - Yeni bölge genişlikleriyle"""
+        # Orijinal boyutta bölge sınırlarını hesapla
+        rw_left = int(self.region_widths[0] * self.scale_factor)
+        rw_mid = int((self.region_widths[0] + self.region_widths[1]) * self.scale_factor)
         rh = int(self.region_height * self.scale_factor)
-        cv2.line(frame, (rw, 0), (rw, self.height), (0, 255, 0), 2)
-        cv2.line(frame, (rw * 2, 0), (rw * 2, self.height), (0, 255, 0), 2)
-        cv2.line(frame, (0, rh), (self.width, rh), (0, 255, 0), 2)
+
+        # Bölge çizgileri
+        cv2.line(frame, (rw_left, 0), (rw_left, self.height), (0, 255, 0), 2)  # Sol-Orta ayrımı
+        cv2.line(frame, (rw_mid, 0), (rw_mid, self.height), (0, 255, 0), 2)  # Orta-Sağ ayrımı
+        cv2.line(frame, (0, rh), (self.width, rh), (0, 255, 0), 2)  # Üst-Alt ayrımı
 
         # Merkez çizgisi
         cv2.line(frame, (self.width // 2, 0), (self.width // 2, self.height), (255, 0, 0), 1)
 
-        # Bölge etiketleri
+        # Bölge etiketleri (konumlar yeni genişliklere göre ayarlandı)
         cv2.putText(frame, "SOL UST", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "ORTA UST", (rw + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "SAG UST", (rw * 2 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "ORTA UST", (rw_left + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "SAG UST", (rw_mid + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         cv2.putText(frame, "SOL ALT", (10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "ORTA ALT", (rw + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "SAG ALT", (rw * 2 + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
+        cv2.putText(frame, "ORTA ALT", (rw_left + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
+                    1)
+        cv2.putText(frame, "SAG ALT", (rw_mid + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
                     1)
 
         return frame
@@ -326,19 +321,17 @@ class LineFollowingAlgorithm:
                 angle, center, lines = self.detect_line_angle(thresh)
                 regions, _ = self.detect_line_position(thresh)
 
-                # YENİ EKLENEN: ÇİZGİ VAR MI KONTROLÜ
+                # ÇİZGİ VAR MI KONTROLÜ
                 cizgi_mevcut = self.cizgi_var_mi(regions)
 
-                # *** YENİ: ÜÇLÜ DURUM KONTROLÜ ***
+                # ÜÇLÜ DURUM KONTROLÜ
                 uclu_var = self.uclu_durum_tespiti(regions)
 
-                # YENİ EKLENEN: ARAMA MODU KONTROLÜ + ÜÇLÜ DURUM
                 if cizgi_mevcut:
                     # Çizgi varsa normal işlem
                     self.cizgi_kayip_sayaci = 0  # Sayacı sıfırla
                     self.son_cizgi_yonunu_guncelle(regions)  # Son yönü güncelle
 
-                    # *** ÜÇLÜ DURUM KONTROLÜ ***
                     if uclu_var:
                         self.uclu_durum_counter += 1
 
@@ -358,11 +351,9 @@ class LineFollowingAlgorithm:
 
                         # Hareket kararı ver
                         if is_viraj:
-                            hareket = self.viraj_fonksiyonu(regions)
-                            mod = "VIRAJ MODU"
+                            hareket, mod = self.viraj_fonksiyonu(regions)
                         else:
-                            hareket = self.duz_cizgi_fonksiyonu(regions, angle, center)
-                            mod = "DUZ CIZGI MODU"
+                            hareket, mod = self.duz_cizgi_fonksiyonu(regions, angle, center)
                 else:
                     # Çizgi yoksa arama moduna geç
                     self.cizgi_kayip_sayaci += 1
@@ -393,7 +384,7 @@ class LineFollowingAlgorithm:
                 cv2.putText(frame, aci_bilgisi, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
                 cv2.putText(frame, bolge_bilgisi, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-                # YENİ EKLENEN: ARAMA MODU BİLGİLERİ
+                # ARAMA MODU BİLGİLERİ
                 cv2.putText(frame, f"Son Cizgi Yonu: {self.son_cizgi_yonu}", (10, 180),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                 cv2.putText(frame, f"Kayip Sayaci: {self.cizgi_kayip_sayaci}", (10, 210),
@@ -401,7 +392,7 @@ class LineFollowingAlgorithm:
                 cv2.putText(frame, f"Cizgi Mevcut: {'EVET' if cizgi_mevcut else 'HAYIR'}", (10, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if cizgi_mevcut else (0, 0, 255), 1)
 
-                # *** YENİ: ÜÇLÜ DURUM BİLGİLERİ ***
+                # ÜÇLÜ DURUM BİLGİLERİ
                 if uclu_var:
                     cv2.putText(frame, f"UCLU DURUM! Counter: {self.uclu_durum_counter}",
                                 (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
@@ -416,7 +407,7 @@ class LineFollowingAlgorithm:
                 # Mod çerçeveleri
                 if mod == "ARAMA MODU":
                     cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (0, 0, 255), 5)
-                elif mod == "TAKIP MODU":  # *** YENİ: TAKIP MODU ÇERÇEVE ***
+                elif mod == "UCLU TAKIP MODU":
                     cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 255, 0), 5)
                 elif mod == "VIRAJ MODU":
                     cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 0, 0), 5)
@@ -432,10 +423,9 @@ class LineFollowingAlgorithm:
             elif key == ord(' '):
                 paused = not paused
                 print("Duraklatıldı" if paused else "Devam ediyor")
-            elif key == ord('r'):  # YENİ EKLENEN: ARAMA MODU SIFIRLAMA
+            elif key == ord('r'):  # ARAMA MODU SIFIRLAMA
                 self.cizgi_kayip_sayaci = 0
                 self.son_cizgi_yonu = "ORTA"
-                # *** YENİ: ÜÇLÜ DURUM SIFIRLAMA ***
                 self.son_viraj_yonu = None
                 self.uclu_durum_counter = 0
                 print("Sistem sıfırlandı")
@@ -448,7 +438,7 @@ class LineFollowingAlgorithm:
 if __name__ == "__main__":
     try:
         # Video dosyası yolunu buraya yazın
-        video_path = "C:/Users/user/Downloads/video3.mp4"
+        video_path = 0  # 0 for webcam
 
         algorithm = LineFollowingAlgorithm(video_path)
         algorithm.run()
