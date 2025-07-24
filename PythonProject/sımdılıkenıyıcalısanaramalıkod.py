@@ -5,7 +5,7 @@ import time
 
 
 class LineFollowingAlgorithm:
-    def _init_(self, video_path=None):
+    def __init__(self, video_path=None):
         if video_path:
             self.cap = cv2.VideoCapture(video_path)
         else:
@@ -24,8 +24,13 @@ class LineFollowingAlgorithm:
         self.process_width = 320
         self.scale_factor = self.width / self.process_width
 
-        # Bölge ayarları (küçültülmüş boyuta göre)
-        self.region_width = self.process_width // 3
+        # *** DEĞİŞTİRİLEN KISIM: Ayarlanabilir bölge genişlikleri ***
+        self.region_ratios = [0.35, 0.30, 0.35]  # Sol, Orta, Sağ oranları (toplam 1.0 olmalı)
+        self.region_widths = [
+            int(self.process_width * self.region_ratios[0]),  # Sol genişlik
+            int(self.process_width * self.region_ratios[1]),  # Orta genişlik
+            int(self.process_width * self.region_ratios[2])   # Sağ genişlik
+        ]
         self.region_height = int(self.height * 0.6 / self.scale_factor)
 
         # Çizgi rengi eşiği (siyah çizgi için)
@@ -119,7 +124,7 @@ class LineFollowingAlgorithm:
             return "HAFIF SOLA DON (ALT UCLU DURUM)", "TAKIP MODU"
 
         else:
-            return "DUZ GIT (TAKIP)", "TAKIP MODU" # kubra bos bırak bısey yazmana gerek yok
+            return "DUZ GIT (TAKIP)", "TAKIP MODU"
 
     def preprocess_frame(self, frame):
         """Görüntüyü küçült ve ön işleme yap"""
@@ -172,18 +177,21 @@ class LineFollowingAlgorithm:
         return None, None, None
 
     def detect_line_position(self, thresh):
-        """Optimize edilmiş bölge tespiti"""
+        """Optimize edilmiş bölge tespiti - Yeni bölge genişlikleriyle"""
         upper_half = thresh[0:self.region_height, :]
         lower_half = thresh[self.region_height:, :]
 
+        # Yeni bölge sınırlarına göre hesaplama
         upper_regions = [
-            np.count_nonzero(upper_half[:, i * self.region_width:(i + 1) * self.region_width])
-            for i in range(3)
+            np.count_nonzero(upper_half[:, 0:self.region_widths[0]]),  # Sol üst
+            np.count_nonzero(upper_half[:, self.region_widths[0]:self.region_widths[0]+self.region_widths[1]]),  # Orta üst
+            np.count_nonzero(upper_half[:, self.region_widths[0]+self.region_widths[1]:])  # Sağ üst
         ]
 
         lower_regions = [
-            np.count_nonzero(lower_half[:, i * self.region_width:(i + 1) * self.region_width])
-            for i in range(3)
+            np.count_nonzero(lower_half[:, 0:self.region_widths[0]]),  # Sol alt
+            np.count_nonzero(lower_half[:, self.region_widths[0]:self.region_widths[0]+self.region_widths[1]]),  # Orta alt
+            np.count_nonzero(lower_half[:, self.region_widths[0]+self.region_widths[1]:])  # Sağ alt
         ]
 
         return upper_regions + lower_regions, thresh
@@ -357,24 +365,28 @@ class LineFollowingAlgorithm:
         return "DUZ GIT", "NORMAL MODU"
 
     def draw_regions(self, frame):
-        """Bölgeleri ve çizgileri görsel olarak çiz"""
-        rw = int(self.region_width * self.scale_factor)
+        """Bölgeleri ve çizgileri görsel olarak çiz - Yeni bölge genişlikleriyle"""
+        # Orijinal boyutta bölge sınırlarını hesapla
+        rw_left = int(self.region_widths[0] * self.scale_factor)
+        rw_mid = int((self.region_widths[0] + self.region_widths[1]) * self.scale_factor)
         rh = int(self.region_height * self.scale_factor)
-        cv2.line(frame, (rw, 0), (rw, self.height), (0, 255, 0), 2)
-        cv2.line(frame, (rw * 2, 0), (rw * 2, self.height), (0, 255, 0), 2)
-        cv2.line(frame, (0, rh), (self.width, rh), (0, 255, 0), 2)
 
+        # Bölge çizgileri
+        cv2.line(frame, (rw_left, 0), (rw_left, self.height), (0, 255, 0), 2)  # Sol-Orta ayrımı
+        cv2.line(frame, (rw_mid, 0), (rw_mid, self.height), (0, 255, 0), 2)    # Orta-Sağ ayrımı
+        cv2.line(frame, (0, rh), (self.width, rh), (0, 255, 0), 2)             # Üst-Alt ayrımı
+
+        # Merkez çizgisi
         cv2.line(frame, (self.width // 2, 0), (self.width // 2, self.height), (255, 0, 0), 1)
 
-        # Bölge etiketleri
+        # Bölge etiketleri (konumlar yeni genişliklere göre ayarlandı)
         cv2.putText(frame, "SOL UST", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "ORTA UST", (rw + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "SAG UST", (rw * 2 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "ORTA UST", (rw_left + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "SAG UST", (rw_mid + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         cv2.putText(frame, "SOL ALT", (10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "ORTA ALT", (rw + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, "SAG ALT", (rw * 2 + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
-                    1)
+        cv2.putText(frame, "ORTA ALT", (rw_left + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "SAG ALT", (rw_mid + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         return frame
 
@@ -503,9 +515,9 @@ class LineFollowingAlgorithm:
         cv2.destroyAllWindows()
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     try:
-        video_path = 0  # "C:/Users/user/Downloads/video3.mp4"  # = webcam, video dosyası için path verin
+        video_path ="C:/Users/user/Downloads/video3.mp4" #0   # = webcam, video dosyası için path verin
 
         algorithm = LineFollowingAlgorithm(video_path)
         algorithm.run()
