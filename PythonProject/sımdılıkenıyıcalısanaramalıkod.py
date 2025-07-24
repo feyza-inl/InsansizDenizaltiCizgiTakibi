@@ -25,7 +25,7 @@ class LineFollowingAlgorithm:
         self.scale_factor = self.width / self.process_width
 
         # *** DEĞİŞTİRİLEN KISIM: Ayarlanabilir bölge genişlikleri ***
-        self.region_ratios = [0.35, 0.30, 0.35]  # Sol, Orta, Sağ oranları (toplam 1.0 olmalı)
+        self.region_ratios = [0.35, 0.30, 0.35]  # Sol, Orta, Sağ oranları (toplam 1.0 olmalı) # sadece buralarla oynayacaksun kübra sutun genıslıklerı ıcın
         self.region_widths = [
             int(self.process_width * self.region_ratios[0]),  # Sol genişlik
             int(self.process_width * self.region_ratios[1]),  # Orta genişlik
@@ -65,11 +65,6 @@ class LineFollowingAlgorithm:
         self.current_state = "NORMAL"
         self.state_counter = 0
 
-        # *** YENİ EKLENEN: ÜÇLÜ DURUM PARAMETRELERİ ***
-        self.son_viraj_yonu = None  # "SAG" veya "SOL"
-        self.uclu_durum_counter = 0  # Üçlü durumda kaç frame
-        self.uclu_esigi = 3  # Kaç frame üçlü durumda kalırsa takibe başla
-
     def cizgi_var_mi(self, regions):
         """Çizgi var mı yok mu kontrol et"""
         return any(region > self.minimum_pixel_esigi for region in regions)
@@ -96,35 +91,6 @@ class LineFollowingAlgorithm:
             return "SAG ARAMA"
         else:
             return "ORTA ARAMA"
-
-    # *** YENİ EKLENEN: ÜÇLÜ DURUM FONKSİYONLARI ***
-    def uclu_durum_tespiti(self, regions):
-        """Üç alt bölge de doluysa True döner"""
-        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-
-        # Üç alt bölge de minimum eşiği aşıyorsa
-        uclu_var = (sol_alt > 800 and
-                    orta_alt > 800 and
-                    sag_alt > 800)
-
-        return uclu_var
-
-    def uclu_durum_algoritması(self, regions):
-        """Son viraj yönüne göre devam et"""
-        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-
-        # AMAÇ: Son viraj yönünde hafif devam ederek çizgiyi takip et
-
-        if self.son_viraj_yonu == "SAG":
-            # Sağ virajdan geldiyse → Hafif SAĞA devam et
-            return "HAFIF SAGA DON (ALT UCLU DURUM)", "TAKIP MODU"
-
-        elif self.son_viraj_yonu == "SOL":
-            # Sol virajdan geldiyse → Hafif SOLA devam et
-            return "HAFIF SOLA DON (ALT UCLU DURUM)", "TAKIP MODU"
-
-        else:
-            return "DUZ GIT (TAKIP)", "TAKIP MODU"
 
     def preprocess_frame(self, frame):
         """Görüntüyü küçült ve ön işleme yap"""
@@ -261,7 +227,7 @@ class LineFollowingAlgorithm:
         return None  # Hiçbir durum uymazsa None döner
 
     def viraj_durumu(self, regions):
-        """2. FONKSİYON: VİRAJ DURUMLARI + SON VİRAJ HAFIZASI"""
+        """2. FONKSİYON: VİRAJ DURUMLARI"""
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
         print(f"DEBUG VIRAJ: orta_ust={orta_ust}, orta_alt={orta_alt}, sag_alt={sag_alt}, sol_alt={sol_alt}")
@@ -274,13 +240,11 @@ class LineFollowingAlgorithm:
         # *** SAĞ VİRAJ: Sağ alt VE Orta alt varsa ***
         if sag_alt > 1000 and orta_alt > 1500:
             print("DEBUG: SAĞ VİRAJ (Sağ alt + Orta alt)")
-            self.son_viraj_yonu = "SAG"  # *** HAFIZA GÜNCELLE ***
             return "SAGA DON"
 
         # *** SOL VİRAJ: Sol alt VE Orta alt varsa ***
         elif sol_alt > 1000 and orta_alt > 1500:
             print("DEBUG: SOL VİRAJ (Sol alt + Orta alt)")
-            self.son_viraj_yonu = "SOL"  # *** HAFIZA GÜNCELLE ***
             return "SOLA DON"
 
         # *** EK VİRAJ KONTROLLERI ***
@@ -288,11 +252,9 @@ class LineFollowingAlgorithm:
         elif orta_alt > 1500:
             if sag_alt < 500 and sol_alt > 800:  # Sağ taraf boş, sol tarafta çizgi
                 print("DEBUG: SOL VİRAJ (Sol taraf dominant)")
-                self.son_viraj_yonu = "SOL"  # *** HAFIZA GÜNCELLE ***
                 return "SOLA DON"
             elif sol_alt < 500 and sag_alt > 800:  # Sol taraf boş, sağ tarafta çizgi
                 print("DEBUG: SAĞ VİRAJ (Sağ taraf dominant)")
-                self.son_viraj_yonu = "SAG"  # *** HAFIZA GÜNCELLE ***
                 return "SAGA DON"
 
         print("DEBUG: Viraj koşulları sağlanmadı")
@@ -312,7 +274,7 @@ class LineFollowingAlgorithm:
         }
 
     def ana_karar_verici(self, regions, angle, center):
-        """ANA KARAR VERİCİ - ÜÇLÜ DURUM DAHİL"""
+        """ANA KARAR VERİCİ"""
 
         # Çizgi var mı kontrolü
         cizgi_mevcut = self.cizgi_var_mi(regions)
@@ -328,23 +290,7 @@ class LineFollowingAlgorithm:
         self.cizgi_kayip_sayaci = 0
         self.son_cizgi_yonunu_guncelle(regions)
 
-        # *** YENİ: ÜÇLÜ DURUM KONTROLÜ ***
-        uclu_var = self.uclu_durum_tespiti(regions)
-
-        if uclu_var:
-            self.uclu_durum_counter += 1
-
-            # Birkaç frame üçlü durumda kalırsa takibe başla
-            if self.uclu_durum_counter >= self.uclu_esigi:
-                return self.uclu_durum_algoritması(regions)
-            else:
-                # Henüz erken, bekle
-                return "BEKLE (UCLU)", "BEKLE MODU"
-        else:
-            # Üçlü durum bittiğinde sayacı sıfırla
-            self.uclu_durum_counter = 0
-
-        # *** YENİ 2 FONKSİYON SİSTEMİ ***
+        # *** 2 FONKSİYON SİSTEMİ ***
 
         # 1. ÖNCE VİRAJ KONTROLÜ
         viraj_sonuc = self.viraj_durumu(regions)
@@ -405,8 +351,8 @@ class LineFollowingAlgorithm:
         return frame
 
     def run(self):
-        """Ana döngü - ÜÇLÜ DURUM DAHİL"""
-        print("*** ÜÇLÜ DURUM DAHİL - ÇİZGİ TAKİBİ ***")
+        """Ana döngü"""
+        print("*** ÇİZGİ TAKİBİ ***")
         print("Çıkmak için 'q' tuşuna basın")
         print("Duraklatmak için 'SPACE' tuşuna basın")
         print("Sıfırlamak için 'r' tuşuna basın")
@@ -468,17 +414,8 @@ class LineFollowingAlgorithm:
                 viraj_color = (0, 0, 255) if viraj_sonuc else (0, 255, 0)
                 cv2.putText(frame, viraj_text, (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, viraj_color, 2)
 
-                # *** YENİ: ÜÇLÜ DURUM BİLGİLERİ ***
-                uclu_var = self.uclu_durum_tespiti(regions)
-                if uclu_var:
-                    cv2.putText(frame, f"UCLU DURUM! Counter: {self.uclu_durum_counter}",
-                                (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-
-                cv2.putText(frame, f"Son Viraj: {self.son_viraj_yonu}",
-                            (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
                 if paused:
-                    cv2.putText(frame, "DURAKLATILDI - SPACE ile devam et", (10, 330),
+                    cv2.putText(frame, "DURAKLATILDI - SPACE ile devam et", (10, 270),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
                 # Mod çerçeveleri
@@ -486,11 +423,9 @@ class LineFollowingAlgorithm:
                     cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (0, 0, 255), 5)
                 elif mod == "ARAMA MODU":
                     cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 0, 0), 5)
-                elif mod == "TAKIP MODU":  # *** YENİ: TAKIP MODU ÇERÇEVE ***
-                    cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 255, 0), 5)
 
                 # Görüntüleri göster
-                cv2.imshow('UCLU DURUM DAHİL - Cizgi Takibi', frame)
+                cv2.imshow('Cizgi Takibi', frame)
                 cv2.imshow('Threshold', cv2.resize(thresh, (320, 240)))
 
             # Tuş kontrolü
@@ -505,9 +440,6 @@ class LineFollowingAlgorithm:
                 self.son_cizgi_yonu = "ORTA"
                 self.current_state = "NORMAL"
                 self.state_counter = 0
-                # *** YENİ: ÜÇLÜ DURUM SIFIRLAMA ***
-                self.son_viraj_yonu = None
-                self.uclu_durum_counter = 0
                 print("Sistem sıfırlandı")
 
         # Temizlik
