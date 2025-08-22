@@ -3,6 +3,7 @@ import numpy as np
 import math
 import time
 
+
 class LineFollowingAlgorithm:
     def __init__(self, video_path=None):
         if video_path:
@@ -32,7 +33,7 @@ class LineFollowingAlgorithm:
         self.upper_threshold = 50
         self.max_allowed_angle = 20
         self.min_line_length = 30
-        self.angle_correction_threshold = 15  # pasted2'deki değer
+        self.angle_correction_threshold = 20  # pasted2'deki değer
 
         # FPS
         self.prev_time = time.time()
@@ -422,97 +423,116 @@ class LineFollowingAlgorithm:
         return abs(angle) > self.angle_correction_threshold
 
     def viraj_tespiti(self, regions):
-        # PASTED2'DEN ALINAN ORİJİNAL ALGORİTMA MANTIĞI
+        # TUTARLI MANTIK - DENİZALTI KODUNDAN
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
+        # 1. DÜZ ÇİZGİ KONTROLÜ (EN ÖNCE)
         if orta_alt > 1000 and orta_ust > 1000:
+            # Orta bölgede güçlü çizgi var -> DÜZ ÇİZGİ (viraj değil)
             return False
 
-        # YENİ MANTIK: Hem üst hem alt varsa yengeç, sadece alt varsa viraj
-
-        # Sağ taraf kontrolü
+        # 2. YENGEÇ KONTROLÜ (SONRA)
+        # Hem üst hem alt varsa -> YENGEÇ (viraj değil)
         if sag_ust > 1000 and sag_alt > 1000:
-            # Hem sağ üst hem sağ alt varsa -> SAG YENGEC (viraj değil)
-            return False
-        elif sag_alt > 1000 and orta_alt <= 1000 and sol_alt <= 1000:
-            # Sadece sağ alt varsa -> SAG VIRAJ
-            return True
-
-        # Sol taraf kontrolü
+            return False  # SAĞ YENGEÇ
         if sol_ust > 1000 and sol_alt > 1000:
-            # Hem sol üst hem sol alt varsa -> SOL YENGEC (viraj değil)
-            return False
-        elif sol_alt > 1000 and orta_alt <= 1000 and sag_alt <= 1000:
-            # Sadece sol alt varsa -> SOL VIRAJ
-            return True
+            return False  # SOL YENGEÇ
 
-        if orta_alt > 1000:
-            if sag_alt > 1000 or sol_alt > 1000:
-                return True
+        # 3. VİRAJ KONTROLÜ (EN SONRA)
+        # Alt bölgelerde çizgi varsa -> VİRAJ
+        if sag_alt > 1000:
+            return True  # SAĞ VİRAJ
+        if sol_alt > 1000:
+            return True  # SOL VİRAJ
+        if orta_alt > 1000 and (sag_alt > 1000 or sol_alt > 1000):
+            return True  # KARMA VİRAJ
 
         return False
 
     def viraj_fonksiyonu(self, regions):
-        # PASTED2'DEN ALINAN ORİJİNAL ALGORİTMA MANTIĞI
+        # TUTARLI MANTIK - DENİZALTI KODUNDAN
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
-        if orta_alt > 1000 and sag_alt > 1000:
-            print("🔄 saga don ")
-            return "SAGA DON"
-        elif orta_alt > 1000 and sol_alt > 1000:
-            print("🔄 Sol don")
-            return "SOLA DON"
-        # YENİ: Sadece sağ alt veya sadece sol alt için viraj
-        elif sag_alt > 1000 and orta_alt <= 1000 and sol_alt <= 1000:
-            print("🔄 saga don")
-            return "SAGA DON"
-        elif sol_alt > 1000 and orta_alt <= 1000 and sag_alt <= 1000:
-            print("🔄 Sol don")
-            return "SOLA DON"
-        else:
-            return "VIRAJ TESPIT EDILEMEDI"
+        # Sağ taraf virajları
+        if sag_alt > 1000:
+            if orta_alt > 1000:
+                print("🔄 saga don (orta+sag)")
+                return "SAGA DON"
+            else:
+                print("🔄 saga don (sadece sag)")
+                return "SAGA DON"
+
+        # Sol taraf virajları
+        if sol_alt > 1000:
+            if orta_alt > 1000:
+                print("🔄 sola don (orta+sol)")
+                return "SOLA DON"
+            else:
+                print("🔄 sola don (sadece sol)")
+                return "SOLA DON"
+
+        return "VIRAJ TESPIT EDILEMEDI"
 
     def duz_cizgi_fonksiyonu(self, regions, angle=None, line_center=None):
-        # PASTED2'DEN ALINAN ORİJİNAL ALGORİTMA MANTIĞI
+        # TUTARLI MANTIK - ÖNCE DÜZ ÇİZGİ, SONRA YENGEÇ
         sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
 
+        # 1. ANA DÜZ ÇİZGİ KONTROLÜ (EN YÜKSEK ÖNCELİK)
         if orta_alt > 1000 and orta_ust > 1000:
-            if self.is_line_angled(angle):
-                if angle < -self.angle_correction_threshold:
-                    print("🔄 saga don")
-                    return "SAGA DON (AÇI DÜZELTMESİ)"
-                elif angle > self.angle_correction_threshold:
-                    print("🔄 Sol don")
-                    return "SOLA DON (AÇI DÜZELTMESİ)"
+            # YENİ ŞART: Açı düzeltmesi sadece yan taraflarda çizgi YOKSA yapılsın
+            if sol_ust <= 1000 and sag_ust <= 1000 and sol_alt <= 1000 and sag_alt <= 1000:
+                # Gerçekten sadece orta bölgelerde çizgi var - açı düzeltmesi yap
+                if self.is_line_angled(angle):
+                    if angle < -self.angle_correction_threshold:
+                        print("🔄 saga don (açı düzeltmesi)")
+                        return "SAGA DON (AÇI DÜZELTMESİ)"
+                    elif angle > self.angle_correction_threshold:
+                        print("🔄 sola don (açı düzeltmesi)")
+                        return "SOLA DON (AÇI DÜZELTMESİ)"
+                print("🔄 duz git (orta güçlü - sadece orta)")
+                return "DUZ GIT"
             else:
-                print("🔄 duz git")
+                # Yan taraflarda da çizgi var - açı düzeltmesi YAPMA
+                print("🔄 duz git (orta güçlü - yan taraflarda çizgi var)")
                 return "DUZ GIT"
 
-        # YENİ MANTIK: Hem üst hem alt varsa yengeç hareketi
+        # 2. YENGEÇ HAREKETLERİ (HEM ÜST HEM ALT)
         if sag_ust > 1000 and sag_alt > 1000:
-            print("🔄 sag yengec")
+            print("🔄 sag yengec (üst+alt)")
             return "SAG YENGEC"
-        elif sol_ust > 1000 and sol_alt > 1000:
-            print("🔄 Sol yengec")
+        if sol_ust > 1000 and sol_alt > 1000:
+            print("🔄 sol yengec (üst+alt)")
             return "SOL YENGEC"
-        # Sadece üst bölgeler için yengeç hareketi
-        elif sol_ust > 1000 and orta_ust <= 1000 and sag_ust <= 1000:
-            print("🔄 Sol yengec")
-            return "SOL YENGEC"
-        elif sag_ust > 1000 and orta_ust <= 1000 and sol_ust <= 1000:
-            print("🔄 sag yengec")
+
+        # 3. SADECE ÜST BÖLGE YENGEÇLERİ
+        if sag_ust > 1000 and orta_ust <= 1000 and sol_ust <= 1000:
+            print("🔄 sag yengec (sadece üst)")
             return "SAG YENGEC"
-        elif orta_ust > 1000 and sol_ust <= 1000 and sag_ust <= 1000:
-            print("🔄 duz git")
+        if sol_ust > 1000 and orta_ust <= 1000 and sag_ust <= 1000:
+            print("🔄 sol yengec (sadece üst)")
+            return "SOL YENGEC"
+
+        # 4. SADECE ORTA ÜST
+        if orta_ust > 1000 and sol_ust <= 1000 and sag_ust <= 1000:
+            # Sadece orta üst varsa da açı düzeltmesi yap
+            if self.is_line_angled(angle):
+                if angle < -self.angle_correction_threshold:
+                    print("🔄 saga don (açı düzeltmesi - sadece orta üst)")
+                    return "SAGA DON (AÇI DÜZELTMESİ)"
+                elif angle > self.angle_correction_threshold:
+                    print("🔄 sola don (açı düzeltmesi - sadece orta üst)")
+                    return "SOLA DON (AÇI DÜZELTMESİ)"
+            print("🔄 duz git (sadece orta üst)")
             return "DUZ GIT"
 
-        # Sadece orta bölge varsa düz git
+        # 5. SADECE ORTA ALT
         if orta_alt > 1000:
-            print("🔄 duz git")
+            print("🔄 duz git (sadece orta alt)")
             return "DUZ GIT"
-        else:
-            print("🔄 duz git")
-            return "DUZ GIT"
+
+        # 6. HİÇBİR ŞEY YOK
+        print("🔄 duz git (default)")
+        return "DUZ GIT"
 
     def draw_info(self, frame, mod, hareket, angle, regions, cizgi_mevcut):
         """Bilgileri çiz"""
@@ -688,7 +708,7 @@ class LineFollowingAlgorithm:
 if __name__ == "__main__":
     try:
         # Video dosyası yolu - buraya kendi video dosyanızın yolunu yazın
-        video_path = r"C:\Users\user\Downloads\video1.mp4"  # 0 = webcam, video dosyası için path verin
+        video_path = r"C:\Users\user\Desktop\WhatsApp Video 2025-08-19 saat 16.57.58_94bc8c18.mp4"  # 0 = webcam, video dosyası için path verin
 
         algorithm = LineFollowingAlgorithm(video_path)
         algorithm.run()
