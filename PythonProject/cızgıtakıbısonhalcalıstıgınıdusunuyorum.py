@@ -9,6 +9,17 @@ import signal
 import subprocess
 import os
 from datetime import datetime
+import json
+
+# IMU import
+try:
+    from Adafruit_BNO055 import BNO055
+
+    IMU_AVAILABLE = True
+    print("✅ IMU kütüphanesi yüklendi")
+except ImportError:
+    IMU_AVAILABLE = False
+    print("⚠ IMU kütüphanesi bulunamadı")
 
 # YOLO imports - eğer kurulu değilse hata vermez
 try:
@@ -38,6 +49,68 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# ==========================
+# IMU ve DERINLIK KONTROL AYARLARI
+# ==========================
+SERIAL_IMU = '/dev/ttyUSB1'
+CONFIG_FILE = 'referans_nokta.json'
+
+# Hedef değerler
+HEDEF_DERINLIK = 0.6  # metre
+HEDEF_PITCH = 0.0  # derece (0 = yatay)
+
+# PID ayarları - Derinlik
+Kp_derinlik = 860.0
+Ki_derinlik = 65.0
+Kd_derinlik = 1000.0
+
+# PID ayarları - Pitch
+Kp_pitch = 5.0
+Ki_pitch = 0.5
+Kd_pitch = 3.0
+
+# PWM değerleri
+PWM_NOTR = 1500
+PWM_MIN = 1100
+PWM_MAX = 1900
+
+# Motor konfigürasyonu (Vertical thrusters)
+MOTOR_ON_SAG = 5
+MOTOR_ON_SOL = 6
+MOTOR_ARKA_SAG = 7
+MOTOR_ARKA_SOL = 8
+
+# Global değişkenler IMU ve derinlik kontrolü için
+imu = None
+ilk_altitude = None
+integral_derinlik = 0.0
+previous_error_derinlik = 0.0
+last_time_derinlik = time.time()
+integral_pitch = 0.0
+previous_error_pitch = 0.0
+last_time_pitch = time.time()
+depth_control_active = True
+
+
+# ==========================
+# YARDIMCI FONKSİYONLAR
+# ==========================
+def clamp(val, lo, hi):
+    return max(min(val, hi), lo)
+
+
+def aci_norm(d):
+    return d % 360
+
+
+def heading_fark(hedef, mevcut):
+    fark = hedef - mevcut
+    if fark > 180:
+        fark -= 360
+    elif fark < -180:
+        fark += 360
+    return fark
+
 
 # --- Pixhawk bağlantısı kur ---
 def baglanti_kur(port="/dev/ttyACM0", baud=57600):
@@ -56,7 +129,7 @@ def baglanti_kur(port="/dev/ttyACM0", baud=57600):
 def pwm_gonder(master, kanal, pwm_deger):
     if master is None:
         return
-    pwm_deger = max(min(pwm_deger, 1900), 1100)
+    pwm_deger = clamp(pwm_deger, PWM_MIN, PWM_MAX)
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
@@ -73,8 +146,13 @@ def pwm_gonder(master, kanal, pwm_deger):
 def stop_motors(master):
     if master is None:
         return
-    for i in range(1, 9):
-        pwm_gonder(master, i, 1500)
+    for i in [MOTOR_ON_SAG, MOTOR_ON_SOL, MOTOR_ARKA_SAG, MOTOR_ARKA_SOL]:
+        pwm_gonder(master, i, PWM_NOTR)
+
+
+def tum_motorlari_durdur(master):
+    """Tüm motorları durdur"""
+    stop_motors(master)
 
 
 # --- ARM komutu gönder ---
@@ -91,97 +169,301 @@ def arm_motors(master):
     print("✅ Motorlar ARM edildi.")
 
 
-# Global değişkenler derinlik kontrolü için
-Kp = 850.0
-Ki = 65.0
-Kd = 1000.0
-hedef_derinlik = 0.6
-integral = 0.0
-previous_error = 0.0
-last_time = time.time()
-ilk_altitude = None
-depth_control_active = True
+# ==========================
+# IMU FONKSİYONLARI
+# ==========================
+def imu_aci_oku():
+    """IMU'dan pitch açısını oku"""
+    global imu
+    if imu is None:
+        return None
+    try:
+        _, p, _ = imu.read_euler()  # pitch değerini al
+        if p is not None:
+            return p
+        return None
+    except:
+        return None
 
 
-def kontrol_motor_pid(master, derinlik):
-    global integral, previous_error, last_time
-    if master is None:
-        return
+def guvenli_pitch_oku():
+    """Güvenli pitch okuma - birkaç deneme yap"""
+    for i in range(3):  # Daha az deneme - performans için
+        pitch = imu_aci_oku()
+        if pitch is not None:
+            return pitch
+        time.sleep(0.05)
+    return None
 
+
+def referans_kaydet():
+    """Referans pitch açısını kaydet"""
+    global imu
+    print("\n" + "=" * 60)
+    print("🎯 REFERANS NOKTA BELİRLEME")
+    print("=" * 60)
+
+    print("\n📍 Referans nokta kaydediliyor...")
+    okumalar = []
+    for i in range(10):  # 20'den 10'a düşürdüm
+        aci = guvenli_pitch_oku()
+        if aci is not None:
+            okumalar.append(aci)
+        print(f"Okuma {i + 1}/10: {aci}°" if aci else f"Okuma {i + 1}/10: HATA")
+        time.sleep(0.2)
+
+    if len(okumalar) < 5:
+        raise RuntimeError("❌ Yeterli okuma yapılamadı!")
+
+    en_iyi_aci = okumalar[0]
+    en_iyi_sayi = 0
+
+    for test_aci in okumalar:
+        sayi = sum(1 for oku_aci in okumalar if abs(test_aci - oku_aci) < 5)
+        if sayi > en_iyi_sayi:
+            en_iyi_sayi = sayi
+            en_iyi_aci = test_aci
+
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump({
+            'referans_pitch': en_iyi_aci,
+            'zaman': time.time(),
+            'okuma_sayisi': len(okumalar),
+            'tutarlilik': en_iyi_sayi
+        }, f, indent=2)
+
+    print(f"\n✅ REFERANS PITCH KAYDEDİLDİ!")
+    print(f"📐 Referans pitch: {en_iyi_aci:.1f}°")
+    return en_iyi_aci
+
+
+def referans_oku():
+    """Kayıtlı referans pitch açısını oku"""
+    if not os.path.exists(CONFIG_FILE):
+        return None
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get('referans_pitch')
+    except:
+        return None
+
+
+# ==========================
+# DERINLIK ve PITCH KONTROLÜ
+# ==========================
+def derinlik_oku(master):
+    """Pixhawk'tan altitude verisi oku"""
+    msg = master.recv_match(type='AHRS2', blocking=False)
+    if msg is not None:
+        return msg.altitude
+    return None
+
+
+def derinlik_kontrol(master):
+    """Derinlik kontrolü"""
+    global ilk_altitude, integral_derinlik, previous_error_derinlik, last_time_derinlik
+
+    # İlk altitude kaydı
+    if ilk_altitude is None:
+        altitude = derinlik_oku(master)
+        if altitude is not None:
+            ilk_altitude = altitude
+            print(f"📍 Başlangıç altitudesi referans alındı: {ilk_altitude:.2f} m")
+        return None, PWM_NOTR
+
+    # Derinlik okuma
+    altitude = derinlik_oku(master)
+    if altitude is None:
+        return None, PWM_NOTR
+
+    # Göreli derinlik: ne kadar aşağı indik?
+    derinlik = ilk_altitude - altitude
+
+    # PID kontrol
     now = time.time()
-    dt = now - last_time
+    dt = now - last_time_derinlik
     if dt <= 0.005:
-        return
-    last_time = now
+        return derinlik, PWM_NOTR
+    last_time_derinlik = now
 
-    error = hedef_derinlik - derinlik
-    integral += error * dt
-    derivative = (error - previous_error) / dt
-    previous_error = error
+    error = HEDEF_DERINLIK - derinlik
+    integral_derinlik += error * dt
+    derivative = (error - previous_error_derinlik) / dt
+    previous_error_derinlik = error
 
-    output = Kp * error + Ki * integral + Kd * derivative
+    output = Kp_derinlik * error + Ki_derinlik * integral_derinlik + Kd_derinlik * derivative
 
+    # Ufak hatalarda küçük kuvvet uygula
     if abs(output) < 100 and abs(error) > 0.01:
         output = 70 if output > 0 else -100
 
-    pwm = int(1500 + output)
-    pwm = max(min(pwm, 1900), 1100)
+    pwm_derinlik = int(PWM_NOTR + output)
+    pwm_derinlik = clamp(pwm_derinlik, PWM_MIN, PWM_MAX)
 
-    print(f"📏 Göreli Derinlik: {derinlik:.3f} m | Hedef: {hedef_derinlik:.2f} m | PWM: {pwm}")
+    return derinlik, pwm_derinlik
 
-    for motor in [5, 6, 7, 8]:
-        pwm_gonder(master, motor, pwm)
+
+def pitch_kontrol():
+    """Pitch açısı kontrolü"""
+    global integral_pitch, previous_error_pitch, last_time_pitch
+
+    # Pitch okuma
+    pitch = guvenli_pitch_oku()
+    if pitch is None:
+        return None, 0
+
+    # PID kontrol
+    now = time.time()
+    dt = now - last_time_pitch
+    if dt <= 0.005:
+        return pitch, 0
+    last_time_pitch = now
+
+    error = HEDEF_PITCH - pitch
+    integral_pitch += error * dt
+    integral_pitch = clamp(integral_pitch, -200, 200)
+    derivative = (error - previous_error_pitch) / dt
+    previous_error_pitch = error
+
+    output = Kp_pitch * error + Ki_pitch * integral_pitch + Kd_pitch * derivative
+    pwm_pitch = int(output * 1.5)  # Ölçeklendirme
+
+    return pitch, pwm_pitch
+
+
+def kombine_kontrol(master):
+    """Derinlik ve pitch kontrolünü kombine et"""
+    if master is None:
+        return
+
+    # Derinlik kontrolü
+    derinlik, pwm_derinlik = derinlik_kontrol(master)
+
+    # Pitch kontrolü
+    pitch, pwm_pitch = pitch_kontrol()
+
+    if derinlik is None or pitch is None:
+        return
+
+    # Motorlara PWM değerlerini uygula
+    # Ön motorlar: derinlik - pitch (pitch düzeltmesi için ters)
+    # Arka motorlar: derinlik + pitch
+    pwm_on_sag = clamp(pwm_derinlik - pwm_pitch, PWM_MIN, PWM_MAX)
+    pwm_on_sol = clamp(pwm_derinlik - pwm_pitch, PWM_MIN, PWM_MAX)
+    pwm_arka_sag = clamp(pwm_derinlik + pwm_pitch, PWM_MIN, PWM_MAX)
+    pwm_arka_sol = clamp(pwm_derinlik + pwm_pitch, PWM_MIN, PWM_MAX)
+
+    pwm_gonder(master, MOTOR_ON_SAG, pwm_on_sag)
+    pwm_gonder(master, MOTOR_ON_SOL, pwm_on_sol)
+    pwm_gonder(master, MOTOR_ARKA_SAG, pwm_arka_sag)
+    pwm_gonder(master, MOTOR_ARKA_SOL, pwm_arka_sol)
+
+    print(f"📏 Derinlik: {derinlik:.3f}m | 🎯 Pitch: {pitch:.1f}° | "
+          f"⚙ Ön: {pwm_on_sag} | Arka: {pwm_arka_sag}")
 
 
 def depth_control_thread(master):
-    global ilk_altitude, depth_control_active, shutdown_flag
+    """Derinlik ve pitch kontrol thread'i"""
+    global depth_control_active, shutdown_flag
 
     if master is None:
         return
 
+    # AHRS2 mesajını aktif et
     master.mav.command_long_send(
         target_system=1,
         target_component=1,
         command=mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
         confirmation=0,
-        param1=178,
-        param2=200000,
+        param1=178,  # AHRS2 ID
+        param2=200000,  # 200ms = 5Hz
         param3=0, param4=0, param5=0, param6=0, param7=0
     )
     print("📡 AHRS2 mesajı aktif edildi!")
 
     while depth_control_active and not shutdown_flag:
         try:
-            msg = master.recv_match(type='AHRS2', blocking=True, timeout=1)
-            if msg is None:
-                continue
-
-            altitude = msg.altitude
-            if ilk_altitude is None:
-                ilk_altitude = altitude
-                print(f"📍 Başlangıç altitudesi: {ilk_altitude:.2f} m")
-                continue
-
-            derinlik = ilk_altitude - altitude
-            kontrol_motor_pid(master, derinlik)
-        except:
-            continue
+            kombine_kontrol(master)
+            time.sleep(0.05)  # 20Hz kontrol döngüsü
+        except Exception as e:
+            print(f"Derinlik kontrol hatası: {e}")
+            time.sleep(0.1)
 
 
 class LineFollowingAlgorithm:
     def _init_(self, video_path=None, model_path="best.pt"):
-        self.cap = None
-        self.width = 640  # Varsayılan değerler
-        self.height = 480
+        if video_path:
+            self.cap = cv2.VideoCapture(video_path)
+        else:
+            # Kamera ayarlarını optimize et - BİRİNCİ KODDAKI AYARLAR
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # 🆕 YOLO Model Yükleme - OPTIMIZED
+        # Video boyutlarını al
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # İşleme için küçültülmüş boyutlar - BİRİNCİ KODDAKI AYARLAR
+        self.process_width = 320
+        self.scale_factor = self.width / self.process_width
+
+        # Ayarlanabilir bölge genişlikleri - BİRİNCİ KODDAKI SUPERIOR BÖLGE AYARLARI
+        self.region_ratios = [0.35, 0.30, 0.35]  # Sol, Orta, Sağ oranları
+        self.region_widths = [
+            int(self.process_width * self.region_ratios[0]),  # Sol genişlik
+            int(self.process_width * self.region_ratios[1]),  # Orta genişlik
+            int(self.process_width * self.region_ratios[2])  # Sağ genişlik
+        ]
+        self.region_height = int(self.height * 0.5 / self.scale_factor)
+
+        # Çizgi rengi eşiği (siyah çizgi için) - BİRİNCİ KODDAKI AYARLAR
+        self.lower_threshold = 0
+        self.upper_threshold = 50
+
+        # *** DÜZELTILMIŞ PARAMETRELER - VIRAJ ÖNCELIKLI SISTEM - BİRİNCİ KODDAN ***
+        self.max_allowed_angle = 15
+        self.min_line_length = 25
+        self.angle_correction_threshold = 15  # Arttırıldı, daha az hassas
+
+        # *** VIRAJ MODU KARARLILIĞI İÇİN YENİ PARAMETRELER - BİRİNCİ KODDAN ***
+        self.viraj_modu_aktif = False
+        self.viraj_modu_suresi = 0
+        self.min_viraj_suresi = 10  # En az 8 frame viraj modunda kalsın
+        self.viraj_cikis_esigi = 3  # 3 frame boyunca viraj tespit edilmezse çık
+
+        # VİRAJ TESPİTİ PARAMETRELERİ - BİRİNCİ KODDAN
+        self.orta_ust_viraj_killer = 500
+        self.viraj_pixel_threshold = 1000
+        self.viraj_dominance_ratio = 1.05
+
+        # NORMAL İŞLEM PARAMETRELERİ - BİRİNCİ KODDAN
+        self.normal_pixel_esigi = 800
+        self.minimum_pixel_esigi = 600
+        self.dominance_ratio = 1.3
+
+        # FPS hesaplama
+        self.prev_time = time.time()
+        self.fps = 0
+
+        # ARAMA MODU PARAMETRELERİ - BİRİNCİ KODDAN
+        self.son_cizgi_yonu = "ORTA"
+        self.cizgi_kayip_sayaci = 0
+        self.kayip_esigi = 5
+
+        # DURUM KONTROLÜ
+        self.current_state = "NORMAL"
+        self.state_counter = 0
+
+        # YOLO Model Yükleme
         self.yolo_model = None
         self.model_path = model_path
         self.anomaly_count = 0
         self.last_anomaly_time = 0
-
-        # 🔧 YOLO OPTIMİZASYONU - 20 FRAME INTERVAL
-        self.yolo_frame_interval = 20  # 20 frame'de bir çalıştır
+        self.yolo_frame_interval = 50  # 20 frame'de bir çalıştır
         self.yolo_frame_counter = 0
         self.last_anomaly_detections = []  # Son tespit edilen anomaliler
         self.anomaly_cooldown = {}  # Her anomali türü için cooldown
@@ -230,69 +512,6 @@ class LineFollowingAlgorithm:
                 print(f"🔍 Dizin içeriği: {os.listdir('.')}")
             print("⚠ Sadece çizgi takibi aktif, anomali tespiti devre dışı")
 
-        # Kamera optimizasyonu - DAHA HIZLI
-        try:
-            if video_path:
-                self.cap = cv2.VideoCapture(video_path)
-            else:
-                # 🔧 KAMERA OPTIMİZASYONU
-                self.cap = cv2.VideoCapture(0)
-                # Daha düşük çözünürlük - daha yüksek FPS
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                self.cap.set(cv2.CAP_PROP_FPS, 30)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimum buffer
-                # Otomatik ayarları kapat - daha stabil
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-
-            # Video boyutlarını al
-            if self.cap.isOpened():
-                self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                print(f"📷 Kamera başlatıldı: {self.width}x{self.height}")
-            else:
-                print("❌ Kamera başlatılamadı, varsayılan değerler kullanılıyor")
-        except Exception as e:
-            print(f"❌ Kamera başlatma hatası: {e}")
-
-        # 🔧 İşleme boyutları - DAHA KÜÇÜK = DAHA HIZLI
-        self.process_width = 240  # 320'den 240'a düşürdüm
-        self.scale_factor = self.width / self.process_width if self.width > 0 else 1.0
-
-        # Bölge ayarları
-        self.region_width = self.process_width // 3
-        self.region_height = int(self.height * 0.5 / self.scale_factor) if self.scale_factor > 0 else 120
-
-        # Çizgi parametreleri
-        self.lower_threshold = 0
-        self.upper_threshold = 50
-        self.max_allowed_angle = 20
-        self.min_line_length = 30
-        self.angle_correction_threshold = 15  # 20'den 15'e düşürdüm - daha hassas açı düzeltmesi
-
-        # FPS
-        self.prev_time = time.time()
-        self.fps = 0
-
-        # Arama parametreleri
-        self.son_cizgi_yonu = "ORTA"
-        self.cizgi_kayip_sayaci = 0
-        self.kayip_esigi = 3
-        self.minimum_pixel_esigi = 500
-
-        # 🔧 K-means parametreleri - OPTIMİZE
-        self.kmeans_clusters = 3
-        self.use_kmeans = True
-        self.kmeans_counter = 0
-        self.kmeans_interval = 15  # 10'dan 15'e çıkardım - daha az sıklıkta çalışsın
-        self.last_kmeans_mask = None
-
-        # Subalti başlangıç parametreleri
-        self.baslangic_suresi = 1.0
-        self.baslangic_zamani = None
-        self.algoritma_aktif = False
-
         # Master bağlantısı
         self.master = None
 
@@ -300,24 +519,348 @@ class LineFollowingAlgorithm:
         """Pixhawk bağlantısını ayarla"""
         self.master = master
 
-    # 🔧 YOLO ANOMALİ TESPİTİ - OPTIMİZE EDİLDİ
+    # *** BİRİNCİ KODDAKI MÜKEMMEL FONKSİYONLAR - TAMAMEN KORUNACAK ***
+    def cizgi_var_mi(self, regions):
+        """Çizgi var mı yok mu kontrol et - BİRİNCİ KODDAN"""
+        return any(region > self.minimum_pixel_esigi for region in regions)
+
+    def son_cizgi_yonunu_guncelle(self, regions):
+        """Son görülen çizginin yönünü güncelle - BİRİNCİ KODDAN"""
+        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+
+        max_value = max(regions)
+        max_index = regions.index(max_value)
+
+        if max_index in [0, 3]:  # Sol üst veya sol alt
+            self.son_cizgi_yonu = "SOL"
+        elif max_index in [1, 4]:  # Orta üst veya orta alt
+            self.son_cizgi_yonu = "ORTA"
+        elif max_index in [2, 5]:  # Sağ üst veya sağ alt
+            self.son_cizgi_yonu = "SAG"
+
+    def arama_modu_karar(self):
+        """Arama modunda hangi yöne gidileceğini belirle - BİRİNCİ KODDAN"""
+        if self.son_cizgi_yonu == "SOL":
+            return "SOL ARAMA"
+        elif self.son_cizgi_yonu == "SAG":
+            return "SAG ARAMA"
+        else:
+            return "ORTA ARAMA"
+
+    def preprocess_frame(self, frame):
+        """Görüntüyü küçült ve ön işleme yap - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+        small_frame = cv2.resize(frame, (self.process_width, int(self.height / self.scale_factor)))
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, self.upper_threshold, 255, cv2.THRESH_BINARY_INV)
+
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+        return gray, thresh, small_frame
+
+    def detect_line_angle(self, gray_frame):
+        """Optimize edilmiş çizgi açısı tespiti - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+        lines = cv2.HoughLinesP(gray_frame, 1, np.pi / 180,
+                                threshold=25,
+                                minLineLength=self.min_line_length,
+                                maxLineGap=15)
+
+        if lines is not None and len(lines) > 0:
+            lines = sorted(lines, key=lambda x: np.linalg.norm(x[0][2:] - x[0][:2]), reverse=True)[:3]
+
+            angles = []
+            centers = []
+            valid_lines = []
+
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+
+                if length > self.min_line_length:
+                    angle = math.degrees(math.atan2(x2 - x1, y2 - y1))
+                    if angle > 90:
+                        angle -= 180
+                    elif angle < -90:
+                        angle += 180
+
+                    if abs(angle) < 45:
+                        center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                        angles.append(angle)
+                        centers.append(center)
+                        valid_lines.append(line[0])
+
+            if angles:
+                avg_angle = np.mean(angles)
+                avg_center = (int(np.mean([c[0] for c in centers])),
+                              int(np.mean([c[1] for c in centers])))
+                return avg_angle, avg_center, valid_lines
+
+        return None, None, None
+
+    def detect_line_position(self, thresh):
+        """Optimize edilmiş bölge tespiti - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+        upper_half = thresh[0:self.region_height, :]
+        lower_half = thresh[self.region_height:, :]
+
+        upper_regions = [
+            np.count_nonzero(upper_half[:, 0:self.region_widths[0]]),  # Sol üst
+            np.count_nonzero(upper_half[:, self.region_widths[0]:self.region_widths[0] + self.region_widths[1]]),
+            # Orta üst
+            np.count_nonzero(upper_half[:, self.region_widths[0] + self.region_widths[1]:])  # Sağ üst
+        ]
+
+        lower_regions = [
+            np.count_nonzero(lower_half[:, 0:self.region_widths[0]]),  # Sol alt
+            np.count_nonzero(lower_half[:, self.region_widths[0]:self.region_widths[0] + self.region_widths[1]]),
+            # Orta alt
+            np.count_nonzero(lower_half[:, self.region_widths[0] + self.region_widths[1]:])  # Sağ alt
+        ]
+
+        return upper_regions + lower_regions, thresh
+
+    def is_line_angled(self, angle):
+        """Çizginin açılı olup olmadığını kontrol eder - BİRİNCİ KODDAN"""
+        if angle is None or self.viraj_modu_aktif:
+            return False
+        return abs(angle) > self.angle_correction_threshold
+
+    def viraj_tespit_et(self, regions):
+        """ÖNCELIKLI VIRAJ TESPIT FONKSIYONU - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+
+        print(f"VIRAJ DEBUG: orta_ust={orta_ust}, orta_alt={orta_alt}, sag_alt={sag_alt}, sol_alt={sol_alt}")
+
+        # *** ÇAKIŞMA ÖNLEYİCİ - Orta üst çok yüksekse viraj değil ***
+        if orta_ust > self.orta_ust_viraj_killer:
+            print(f"VIRAJ DEBUG: Orta üst çok yüksek ({orta_ust}) - Viraj değil")
+            return False
+
+        # *** GÜÇLÜ VİRAJ TESPİTLERİ ***
+
+        # SAĞ VİRAJ: Sağ alt VE Orta alt birlikte
+        if sag_alt > 1000 and orta_alt > 1200:
+            print("VIRAJ DEBUG: GÜÇLÜ SAĞ VİRAJ tespit edildi")
+            return "SAGA DON"
+
+        # SOL VİRAJ: Sol alt VE Orta alt birlikte
+        if sol_alt > 1000 and orta_alt > 1200:
+            print("VIRAJ DEBUG: GÜÇLÜ SOL VİRAJ tespit edildi")
+            return "SOLA DON"
+
+        # *** TEK TARAF VİRAJLARI (Üst bölgede çizgi olmamalı) ***
+        ust_toplam = sol_ust + orta_ust + sag_ust
+
+        # Sadece sağ altta çizgi var, üstte yok
+        if sag_alt > 1000 and sol_alt < 500 and orta_alt < 800 and ust_toplam < 1500:
+            print("VIRAJ DEBUG: SAĞ KÖŞE VİRAJ")
+            return "SAGA DON"
+
+        # Sadece sol altta çizgi var, üstte yok
+        if sol_alt > 1000 and sag_alt < 500 and orta_alt < 800 and ust_toplam < 1500:
+            print("VIRAJ DEBUG: SOL KÖŞE VİRAJ")
+            return "SOLA DON"
+
+        # *** ORTA ALT DOMİNANT VİRAJLAR ***
+        if orta_alt > 2000:  # Çok yüksek orta alt
+            if sag_alt > sol_alt * 1.5 and sag_alt > 800:
+                print("VIRAJ DEBUG: SAĞ TARAF DOMINANT VİRAJ")
+                return "SAGA DON"
+            elif sol_alt > sag_alt * 1.5 and sol_alt > 800:
+                print("VIRAJ DEBUG: SOL TARAF DOMINANT VİRAJ")
+                return "SOLA DON"
+
+        print("VIRAJ DEBUG: Viraj tespit edilmedi")
+        return False
+
+    def duz_cizgi_durumu(self, regions, angle=None):
+        """DÜZ ÇİZGİ DURUMLARI - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+        if self.viraj_modu_aktif:
+            return None  # Viraj modundayken düz çizgi kontrolü yapma
+
+        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+
+        # *** DÜZ GİT DURUMLARI - AÇI KONTROLÜ İLE ***
+        if orta_ust > 1000 and orta_alt > 1000:
+            if self.is_line_angled(angle):
+                if angle < -self.angle_correction_threshold:
+                    return "HAFIF SAGA DON"
+                elif angle > self.angle_correction_threshold:
+                    return "HAFIF SOLA DON"
+            return "DUZ GIT"
+
+        elif orta_ust > 1000 and sol_ust <= 1000 and sag_ust <= 1000:
+            if self.is_line_angled(angle):
+                if angle < -self.angle_correction_threshold:
+                    return "HAFIF SAGA DON"
+                elif angle > self.angle_correction_threshold:
+                    return "HAFIF SOLA DON"
+            return "DUZ GIT"
+
+        # *** YENGEC DURUMLARI ***
+        elif sol_ust > 1000 and sol_alt > 1000:
+            return "SOL YENGEC"
+        elif sol_ust > 1000 and orta_ust <= 1000 and sag_ust <= 1000:
+            return "SOL YENGEC"
+        elif sag_ust > 1000 and sag_alt > 1000:
+            return "SAG YENGEC"
+        elif sag_ust > 1000 and orta_ust <= 1000 and sol_ust <= 1000:
+            return "SAG YENGEC"
+
+        # *** ALT BÖLGE KONTROLÜ ***
+        else:
+            if orta_alt > 1000 and sol_alt <= 1000 and sag_alt <= 1000:
+                return "DUZ GIT"
+
+        return None
+
+    def viraj_modu_yonetimi(self, regions):
+        """VİRAJ MODU KARARLILIĞI YÖNETİMİ - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+        viraj_tespit = self.viraj_tespit_et(regions)
+
+        if viraj_tespit:
+            # Viraj tespit edildi
+            if not self.viraj_modu_aktif:
+                # Viraj moduna geç
+                self.viraj_modu_aktif = True
+                self.viraj_modu_suresi = 0
+                print(">>> VİRAJ MODU BAŞLADI <<<")
+            else:
+                # Viraj modu devam ediyor
+                self.viraj_modu_suresi += 1
+
+            return viraj_tespit, "VIRAJ MODU"
+
+        else:
+            # Viraj tespit edilmedi
+            if self.viraj_modu_aktif:
+                # Minimum süre geçti mi kontrol et
+                if self.viraj_modu_suresi >= self.min_viraj_suresi:
+                    # Çıkış koşullarını kontrol et
+                    self.viraj_cikis_esigi -= 1
+                    if self.viraj_cikis_esigi <= 0:
+                        # Viraj modundan çık
+                        self.viraj_modu_aktif = False
+                        self.viraj_cikis_esigi = 3  # Reset
+                        print(">>> VİRAJ MODU BİTTİ <<<")
+                        return None, "NORMAL MODA GEÇİŞ"
+                    else:
+                        # Hala viraj modunda kal, son komutu tekrarla
+                        return "SAGA DON" if self.son_cizgi_yonu == "SAG" else "SOLA DON", "VIRAJ MODU (DEVAM)"
+                else:
+                    # Minimum süre geçmedi, viraj modunda kal
+                    self.viraj_modu_suresi += 1
+                    return "SAGA DON" if self.son_cizgi_yonu == "SAG" else "SOLA DON", "VIRAJ MODU (MIN SÜRE)"
+
+        return None, None
+
+    def ana_karar_verici(self, regions, angle, center):
+        """ANA KARAR VERİCİ - VİRAJ ÖNCELİKLİ SİSTEM - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+
+        # Çizgi var mı kontrolü
+        cizgi_mevcut = self.cizgi_var_mi(regions)
+
+        if not cizgi_mevcut:
+            self.cizgi_kayip_sayaci += 1
+            if self.cizgi_kayip_sayaci >= self.kayip_esigi:
+                return self.arama_modu_karar(), "ARAMA MODU"
+            else:
+                return "BEKLE", "BEKLE MODU"
+
+        # Çizgi varsa normal işlem
+        self.cizgi_kayip_sayaci = 0
+        self.son_cizgi_yonunu_guncelle(regions)
+
+        # *** 1. ÖNCE VİRAJ MODU YÖNETİMİ (EN ÖNCELİKLİ) ***
+        viraj_karar, viraj_mod = self.viraj_modu_yonetimi(regions)
+        if viraj_karar:
+            return viraj_karar, viraj_mod
+
+        # *** 2. SONRA DÜZ ÇİZGİ KONTROLÜ (VİRAJ MODUNDA DEĞİLSE) ***
+        if not self.viraj_modu_aktif:
+            duz_cizgi_sonuc = self.duz_cizgi_durumu(regions, angle)
+            if duz_cizgi_sonuc:
+                if "HAFIF" in duz_cizgi_sonuc:
+                    return duz_cizgi_sonuc, "AÇI DÜZELTMESİ"
+                elif "YENGEC" in duz_cizgi_sonuc:
+                    return duz_cizgi_sonuc, "YENGEC MODU"
+                else:
+                    return duz_cizgi_sonuc, "NORMAL MODU"
+
+        # *** 3. VARSAYILAN ***
+        return "DUZ GIT", "NORMAL MODU"
+
+    def calculate_ratios(self, regions):
+        """Debug için oran hesaplama - BİRİNCİ KODDAN"""
+        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+
+        def safe_ratio(a, b):
+            return a / b if b > 0 else 0
+
+        return {
+            'sol_alt_vs_orta_alt': safe_ratio(sol_alt, orta_alt),
+            'sag_alt_vs_orta_alt': safe_ratio(sag_alt, orta_alt),
+            'orta_alt_vs_orta_ust': safe_ratio(orta_alt, orta_ust),
+        }
+
+    def draw_regions(self, frame):
+        """Bölgeleri ve çizgileri görsel olarak çiz - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM"""
+        rw_left = int(self.region_widths[0] * self.scale_factor)
+        rw_mid = int((self.region_widths[0] + self.region_widths[1]) * self.scale_factor)
+        rh = int(self.region_height * self.scale_factor)
+
+        # Bölge çizgileri
+        cv2.line(frame, (rw_left, 0), (rw_left, self.height), (0, 255, 0), 2)
+        cv2.line(frame, (rw_mid, 0), (rw_mid, self.height), (0, 255, 0), 2)
+        cv2.line(frame, (0, rh), (self.width, rh), (0, 255, 0), 2)
+
+        # Merkez çizgisi
+        cv2.line(frame, (self.width // 2, 0), (self.width // 2, self.height), (255, 0, 0), 1)
+
+        # Bölge etiketleri
+        cv2.putText(frame, "SOL UST", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "ORTA UST", (rw_left + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "SAG UST", (rw_mid + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.putText(frame, "SOL ALT", (10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "ORTA ALT", (rw_left + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
+                    1)
+        cv2.putText(frame, "SAG ALT", (rw_mid + 10, self.height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
+                    1)
+
+        return frame
+
+    def draw_detected_line(self, frame, lines, center, angle):
+        """Tespit edilen çizgiyi ve bilgilerini çiz - BİRİNCİ KODDAN"""
+        if lines:
+            for line in lines:
+                x1, y1, x2, y2 = [int(x * self.scale_factor) for x in line]
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+            if center:
+                cx, cy = [int(c * self.scale_factor) for c in center]
+                cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+                cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 2)
+
+        return frame
+
+    # YOLO ANOMALI TESPITI - IKINCI KODDAKI CALISIR HALI KORUNACAK
     def detect_anomalies(self, frame):
-        """YOLO ile anomali tespiti yap - OPTIMIZED"""
+        """YOLO ile anomali tespiti yap"""
         anomalies = []
 
         if self.yolo_model is None:
             return anomalies, frame
 
-        # 🔧 FRAME INTERVAL KONTROLÜ - 20 FRAME'DE BİR
+        # Frame interval kontrolü
         self.yolo_frame_counter += 1
         if self.yolo_frame_counter % self.yolo_frame_interval != 0:
-            return anomalies, frame
+            return [], frame
 
         try:
             print(f"🔍 YOLO Frame {self.yolo_frame_counter} - Anomali tespiti çalışıyor...")
 
-            # YOLO modelini çalıştır - optimize edilmiş ayarlar
-            results = self.yolo_model(frame, verbose=False, conf=0.4, imgsz=320)  # Daha küçük imgsz
+            # YOLO modelini çalıştır
+            results = self.yolo_model(frame, verbose=False, conf=0.4, imgsz=320)
 
             current_time = time.time()
             current_frame = self.yolo_frame_counter
@@ -339,8 +882,8 @@ class LineFollowingAlgorithm:
                             else:
                                 class_name = f"Anomali_{class_id}"
 
-                            # 🔧 COOLDOWN KONTROLÜ - AYNI ANOMALİ TEKRAR TESPİT ETME
-                            anomaly_key = f"{class_name}{int(x1 // 50)}{int(y1 // 50)}"  # Bölgesel gruplandırma
+                            # Cooldown kontrolü
+                            anomaly_key = f"{class_name}{int(x1 // 50)}{int(y1 // 50)}"
 
                             if anomaly_key in self.anomaly_cooldown:
                                 if current_frame - self.anomaly_cooldown[anomaly_key] < self.anomaly_cooldown_duration:
@@ -363,7 +906,7 @@ class LineFollowingAlgorithm:
 
                             print(f"🚨 YENİ ANOMALİ: {class_name} (Güven: {confidence:.3f}) Frame: {current_frame}")
 
-                            # Frame üzerine çiz - BÜYÜK VE NET
+                            # Frame üzerine çiz
                             color = (0, 0, 255)  # Kırmızı
                             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
 
@@ -411,840 +954,180 @@ class LineFollowingAlgorithm:
         except Exception as e:
             print(f"❌ Log yazma hatası: {e}")
 
-    def cizgi_var_mi(self, regions):
-        return any(region > self.minimum_pixel_esigi for region in regions)
+    # MOTOR KONTROL FONKSIYONLARI - IKINCI KODDAKI CALISIR HALI
+    def execute_movement(self, hareket):
+        """Hareketi motora çevir ve uygula"""
+        if self.master is None:
+            return
 
-    def son_cizgi_yonunu_guncelle(self, regions):
-        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-        max_value = max(regions)
-        max_index = regions.index(max_value)
-
-        if max_index in [0, 3]:
-            self.son_cizgi_yonu = "SOL"
-        elif max_index in [1, 4]:
-            self.son_cizgi_yonu = "ORTA"
-        elif max_index in [2, 5]:
-            self.son_cizgi_yonu = "SAG"
-
-    def arama_modu_karar(self):
-        if self.son_cizgi_yonu == "SOL":
+        if hareket == "DUZ GIT":
+            print("🔄 duz git")
+            pwm_gonder(self.master, 1, 1615)
+            pwm_gonder(self.master, 2, 1600)
+            pwm_gonder(self.master, 3, 1615)
+            pwm_gonder(self.master, 4, 1600)
+        elif hareket == "SAGA DON":
+            print("🔄 saga don")
+            pwm_gonder(self.master, 1, 1490)
+            pwm_gonder(self.master, 2, 1650)
+            pwm_gonder(self.master, 3, 1490)
+            pwm_gonder(self.master, 4, 1650)
+        elif hareket == "SOLA DON":
+            print("🔄 sola don")
+            pwm_gonder(self.master, 1, 1700)
+            pwm_gonder(self.master, 2, 1490)
+            pwm_gonder(self.master, 3, 1700)
+            pwm_gonder(self.master, 4, 1490)
+        elif hareket == "HAFIF SAGA DON":
+            print("🔄 hafif saga don")
+            pwm_gonder(self.master, 1, 1490)
+            pwm_gonder(self.master, 2, 1600)
+            pwm_gonder(self.master, 3, 1490)
+            pwm_gonder(self.master, 4, 1600)
+        elif hareket == "HAFIF SOLA DON":
+            print("🔄 hafif sola don")
+            pwm_gonder(self.master, 1, 1650)
+            pwm_gonder(self.master, 2, 1490)
+            pwm_gonder(self.master, 3, 1650)
+            pwm_gonder(self.master, 4, 1490)
+        elif hareket == "SAG YENGEC":
+            print("🔄 sag yengec")
+            pwm_gonder(self.master, 1, 1300)
+            pwm_gonder(self.master, 2, 1700)
+            pwm_gonder(self.master, 3, 1750)
+            pwm_gonder(self.master, 4, 1280)
+        elif hareket == "SOL YENGEC":
+            print("🔄 sol yengec")
+            pwm_gonder(self.master, 1, 1730)
+            pwm_gonder(self.master, 2, 1300)
+            pwm_gonder(self.master, 3, 1270)
+            pwm_gonder(self.master, 4, 1700)
+        elif hareket == "SOL ARAMA":
             print("🔄 sol arama")
             pwm_gonder(self.master, 1, 1750)
             pwm_gonder(self.master, 2, 1530)
             pwm_gonder(self.master, 3, 1750)
             pwm_gonder(self.master, 4, 1530)
-            return "SOL ARAMA"
-        elif self.son_cizgi_yonu == "SAG":
-            print("🔄 Sag arama")
+        elif hareket == "SAG ARAMA":
+            print("🔄 sag arama")
             pwm_gonder(self.master, 1, 1570)
             pwm_gonder(self.master, 2, 1650)
             pwm_gonder(self.master, 3, 1570)
             pwm_gonder(self.master, 4, 1650)
-            return "SAG ARAMA"
-        else:
-            print("🔄 Orta arama")
+        elif hareket == "ORTA ARAMA":
+            print("🔄 orta arama")
             pwm_gonder(self.master, 1, 1400)
             pwm_gonder(self.master, 2, 1400)
             pwm_gonder(self.master, 3, 1400)
             pwm_gonder(self.master, 4, 1400)
-            return "ORTA ARAMA"
 
-    # 🔧 PIKSel yoğunluğu hesaplama - OPTIMİZE
-    def calculate_pixel_density(self, image):
-        """Piksel yoğunluğunu hesapla - HIZLI"""
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-
-            # Daha küçük kernel - daha hızlı
-            grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            gradient_magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
-            gradient_magnitude = cv2.normalize(gradient_magnitude, None, 0, 255, cv2.NORM_MINMAX)
-
-            return gradient_magnitude.astype(np.uint8)
-        except:
-            return np.zeros_like(image[:, :, 0] if len(image.shape) == 3 else image)
-
-    # 🔧 HIZLI K-means - DAHA DA OPTIMİZE
-    def fast_kmeans(self, features, k=3, max_iters=2):  # 3'ten 2'ye düşürdüm
-        """Çok hızlı K-means implementasyonu"""
-        try:
-            n_samples, n_features = features.shape
-
-            # Her 20. pikseli kullan (daha da hızlı)
-            sample_indices = np.arange(0, n_samples, 20)
-            sample_features = features[sample_indices]
-
-            # Rastgele merkezler başlat
-            np.random.seed(42)
-            centroids = sample_features[np.random.choice(len(sample_features), k, replace=False)]
-
-            for _ in range(max_iters):
-                # Her noktayı en yakın merkeze ata
-                distances = np.sqrt(((sample_features - centroids[:, np.newaxis]) ** 2).sum(axis=2))
-                labels = np.argmin(distances, axis=0)
-
-                # Merkezleri güncelle
-                new_centroids = np.array([sample_features[labels == i].mean(axis=0) if np.sum(labels == i) > 0
-                                          else centroids[i] for i in range(k)])
-
-                centroids = new_centroids
-
-            # Tüm noktalara etiket ata
-            distances = np.sqrt(((features - centroids[:, np.newaxis]) ** 2).sum(axis=2))
-            all_labels = np.argmin(distances, axis=0)
-
-            return all_labels, centroids
-        except:
-            return np.random.randint(0, k, features.shape[0]), None
-
-    # 🔧 HIZLI K-means segmentasyon - OPTIMİZE
-    def segment_with_kmeans(self, image, pixel_density):
-        """Çok hızlı K-means ile segmentasyon yap"""
-        try:
-            h, w = image.shape[:2]
-
-            # Daha da küçük boyut - çok daha hızlı
-            small_h, small_w = h // 3, w // 3  # 2'den 3'e çıkardım
-            small_image = cv2.resize(image, (small_w, small_h))
-            small_density = cv2.resize(pixel_density, (small_w, small_h))
-
-            # Özellik vektörü oluştur
-            features = []
-            for y in range(small_h):
-                for x in range(small_w):
-                    if len(small_image.shape) == 3:
-                        b, g, r = small_image[y, x]
-                    else:
-                        b = g = r = small_image[y, x]
-                    density = small_density[y, x]
-                    features.append([b, g, r, density])
-
-            features = np.array(features, dtype=np.float32)
-
-            # Hızlı K-means kümeleme
-            labels, centroids = self.fast_kmeans(features, self.kmeans_clusters)
-
-            # Sonucu küçük görüntü formatına çevir
-            small_segmented = labels.reshape(small_h, small_w)
-
-            # Orijinal boyuta geri büyüt
-            segmented = cv2.resize(small_segmented.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
-
-            return segmented.astype(np.uint8), centroids
-        except Exception as e:
-            print(f"K-means hatası: {e}")
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-            _, thresh = cv2.threshold(gray, self.upper_threshold, 255, cv2.THRESH_BINARY_INV)
-            return thresh // 255, None
-
-    def identify_line_cluster(self, image, segmented, centroids):
-        """Siyah çizgiye ait kümeyi belirle - SEÇİCİ"""
-        try:
-            if centroids is None:
-                return 1
-
-            cluster_stats = []
-            h, w = segmented.shape
-
-            for cluster_id in range(self.kmeans_clusters):
-                mask = (segmented == cluster_id)
-
-                if len(image.shape) == 3:
-                    cluster_pixels = image[mask]
-                else:
-                    cluster_pixels = np.column_stack([image[mask]] * 3)
-
-                if len(cluster_pixels) > 0:
-                    mean_color = np.mean(cluster_pixels, axis=0)
-                    mean_brightness = np.mean(mean_color)
-                    pixel_count = np.sum(mask)
-
-                    is_dark_enough = mean_brightness < 80
-                    is_reasonable_size = 100 < pixel_count < (h * w * 0.3)
-
-                    y_coords, x_coords = np.where(mask)
-                    if len(y_coords) > 0:
-                        width_span = np.max(x_coords) - np.min(x_coords)
-                        height_span = np.max(y_coords) - np.min(y_coords)
-                        aspect_ratio = max(width_span, height_span) / (min(width_span, height_span) + 1)
-                        is_line_shaped = aspect_ratio > 3
-
-                        center_x = np.mean(x_coords)
-                        distance_from_center = abs(center_x - w / 2) / (w / 2)
-                        is_center_aligned = distance_from_center < 0.7
-                    else:
-                        is_line_shaped = False
-                        is_center_aligned = False
-
-                    color_std = np.std(cluster_pixels, axis=0)
-                    is_uniform = np.mean(color_std) < 30
-
-                    line_score = 0
-                    if is_dark_enough:
-                        line_score += 40
-                    if is_reasonable_size:
-                        line_score += 30
-                    if is_line_shaped:
-                        line_score += 20
-                    if is_center_aligned:
-                        line_score += 10
-                    if is_uniform:
-                        line_score += 10
-
-                    cluster_stats.append({
-                        'id': cluster_id,
-                        'score': line_score,
-                        'brightness': mean_brightness,
-                        'pixel_count': pixel_count
-                    })
-
-            valid_clusters = [c for c in cluster_stats if c['score'] >= 70]
-
-            if valid_clusters:
-                best_cluster = max(valid_clusters, key=lambda x: x['score'])
-                return best_cluster['id']
-            else:
-                if cluster_stats:
-                    darkest = min(cluster_stats, key=lambda x: x['brightness'])
-                    return darkest['id']
-                return 1
-
-        except Exception as e:
-            print(f"Çizgi tespit hatası: {e}")
-            return 1
-
-    def extract_kmeans_mask(self, segmented, line_cluster_id):
-        """K-means sonucundan çizgi maskesini çıkar - OPTIMİZE"""
-        try:
-            line_mask = (segmented == line_cluster_id).astype(np.uint8) * 255
-
-            # Küçük gürültüleri temizle - daha küçük kernel
-            kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))  # 3'ten 2'ye
-            line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, kernel_small)
-
-            # Kontür analizi
-            contours, _ = cv2.findContours(line_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            clean_mask = np.zeros_like(line_mask)
-
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area < 50 or area > line_mask.shape[0] * line_mask.shape[1] * 0.4:  # 100'den 50'ye
-                    continue
-
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = max(w, h) / (min(w, h) + 1)
-
-                if aspect_ratio > 2:
-                    cv2.drawContours(clean_mask, [contour], -1, 255, -1)
-
-            # Son temizlik - daha küçük kernel
-            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # 5'ten 3'e
-            clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
-
-            return clean_mask
-
-        except Exception as e:
-            print(f"Maske çıkarma hatası: {e}")
-            return np.zeros(segmented.shape, dtype=np.uint8)
-
-    # 🔧 PREPROCESS FRAME - OPTIMİZE
-    def preprocess_frame(self, frame):
-        try:
-            # Daha küçük boyuta resize - daha hızlı işlem
-            small_frame = cv2.resize(frame, (self.process_width, int(self.height / self.scale_factor)))
-            gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-
-            # K-means kullanımı (daha az sıklıkta)
-            if self.use_kmeans and self.kmeans_counter % self.kmeans_interval == 0:
-                try:
-                    pixel_density = self.calculate_pixel_density(small_frame)
-                    segmented, centroids = self.segment_with_kmeans(small_frame, pixel_density)
-                    line_cluster_id = self.identify_line_cluster(small_frame, segmented, centroids)
-                    kmeans_mask = self.extract_kmeans_mask(segmented, line_cluster_id)
-
-                    if np.sum(kmeans_mask) > 100 and np.sum(kmeans_mask) < (
-                            small_frame.shape[0] * small_frame.shape[1] * 0.5):  # 200'den 100'e
-                        self.last_kmeans_mask = kmeans_mask
-                        self.kmeans_counter += 1
-                        return gray, kmeans_mask, small_frame
-                except Exception as e:
-                    print(f"K-means işleminde hata: {e}")
-
-            # Yakın zamanda K-means çalıştıysa onu kullan
-            elif self.use_kmeans and self.last_kmeans_mask is not None and self.kmeans_counter % self.kmeans_interval < 8:  # 5'ten 8'e
-                self.kmeans_counter += 1
-                return gray, self.last_kmeans_mask, small_frame
-
-            # Normal threshold
-            _, thresh = cv2.threshold(gray, self.upper_threshold, 255, cv2.THRESH_BINARY_INV)
-            kernel = np.ones((2, 2), np.uint8)  # 3'ten 2'ye küçült
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-            self.kmeans_counter += 1
-            return gray, thresh, small_frame
-        except:
-            empty = np.zeros((int(self.height / self.scale_factor), self.process_width), dtype=np.uint8)
-            return empty, empty, empty
-
-    def detect_line_angle(self, gray_frame):
-        try:
-            lines = cv2.HoughLinesP(gray_frame, 1, np.pi / 180,
-                                    threshold=25,  # 30'dan 25'e düşürdüm
-                                    minLineLength=self.min_line_length,
-                                    maxLineGap=20)
-
-            if lines is not None:
-                lines = sorted(lines, key=lambda x: np.linalg.norm(x[0][2:] - x[0][:2]), reverse=True)[:2]
-                angles = []
-                centers = []
-                valid_lines = []
-
-                for line in lines:
-                    x1, y1, x2, y2 = line[0]
-                    length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-
-                    if length > self.min_line_length:
-                        angle = math.degrees(math.atan2(x2 - x1, y2 - y1))
-                        if angle > 90:
-                            angle -= 180
-                        elif angle < -90:
-                            angle += 180
-
-                        center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                        angles.append(angle)
-                        centers.append(center)
-                        valid_lines.append(line[0])
-
-                if angles:
-                    avg_angle = np.mean(angles)
-                    avg_center = (int(np.mean([c[0] for c in centers])),
-                                  int(np.mean([c[1] for c in centers])))
-                    return avg_angle, avg_center, valid_lines
-        except:
-            pass
-        return None, None, None
-
-    def detect_line_position(self, thresh):
-        try:
-            upper_half = thresh[0:self.region_height, :]
-            lower_half = thresh[self.region_height:, :]
-
-            upper_regions = [
-                np.count_nonzero(upper_half[:, i * self.region_width:(i + 1) * self.region_width])
-                for i in range(3)
-            ]
-
-            lower_regions = [
-                np.count_nonzero(lower_half[:, i * self.region_width:(i + 1) * self.region_width])
-                for i in range(3)
-            ]
-
-            return upper_regions + lower_regions, thresh
-        except:
-            return [0, 0, 0, 0, 0, 0], thresh
-
-    def is_line_angled(self, angle):
-        if angle is None:
-            return False
-        return abs(angle) > self.angle_correction_threshold
-
-    def viraj_tespiti(self, regions):
-        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-
-        # 1. DÜZ ÇİZGİ KONTROLÜ (EN ÖNCE)
-        if orta_alt > 1000 and orta_ust > 1000:
-            return False
-
-        # 2. YENGEÇ KONTROLÜ (SONRA)
-        if sag_ust > 1000 and sag_alt > 1000:
-            return False  # SAĞ YENGEÇ
-        if sol_ust > 1000 and sol_alt > 1000:
-            return False  # SOL YENGEÇ
-
-        # 3. VİRAJ KONTROLÜ (EN SONRA)
-        if sag_alt > 1000:
-            return True  # SAĞ VİRAJ
-        if sol_alt > 1000:
-            return True  # SOL VİRAJ
-        if orta_alt > 1000 and (sag_alt > 1000 or sol_alt > 1000):
-            return True  # KARMA VİRAJ
-
-        return False
-
-    # 🔧 VİRAJ FONKSİYONU - FEEDBACK MEKANİZMASI EKLENDİ
-    def viraj_fonksiyonu(self, regions):
-        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-
-        # 🆕 FEEDBACK MEKANİZMASI - İSTEDİĞİN MANTIK
-        # Orta altta pixel varsa, sol ve sağ alt karşılaştır
-        if orta_alt > 1000:
-            if sag_alt > sol_alt and sag_alt > 500:  # Sağ alt daha fazla
-                print("🔄 saga don (feedback: sag_alt > sol_alt)")
-                pwm_gonder(self.master, 1, 1490)
-                pwm_gonder(self.master, 2, 1650)
-                pwm_gonder(self.master, 3, 1490)
-                pwm_gonder(self.master, 4, 1650)
-                return "SAGA DON (FEEDBACK)"
-            elif sol_alt > sag_alt and sol_alt > 500:  # Sol alt daha fazla
-                print("🔄 sola don (feedback: sol_alt > sag_alt)")
-                pwm_gonder(self.master, 1, 1900)
-                pwm_gonder(self.master, 2, 1490)
-                pwm_gonder(self.master, 3, 1900)
-                pwm_gonder(self.master, 4, 1490)
-                return "SOLA DON (FEEDBACK)"
-
-        # ORİJİNAL VİRAJ MANTIGI (feedback olmadığında)
-        # Sağ taraf virajları
-        if sag_alt > 1000:
-            if orta_alt > 1000:
-                print("🔄 saga don (orta+sag)")
-                pwm_gonder(self.master, 1, 1490)
-                pwm_gonder(self.master, 2, 1650)
-                pwm_gonder(self.master, 3, 1490)
-                pwm_gonder(self.master, 4, 1650)
-                return "SAGA DON"
-            else:
-                print("🔄 saga don (sadece sag)")
-                pwm_gonder(self.master, 1, 1490)
-                pwm_gonder(self.master, 2, 1650)
-                pwm_gonder(self.master, 3, 1490)
-                pwm_gonder(self.master, 4, 1650)
-                return "SAGA DON"
-
-        # Sol taraf virajları
-        if sol_alt > 1000:
-            if orta_alt > 1000:
-                print("🔄 sola don (orta+sol)")
-                pwm_gonder(self.master, 1, 1900)
-                pwm_gonder(self.master, 2, 1490)
-                pwm_gonder(self.master, 3, 1900)
-                pwm_gonder(self.master, 4, 1490)
-                return "SOLA DON"
-            else:
-                print("🔄 sola don (sadece sol)")
-                pwm_gonder(self.master, 1, 1900)
-                pwm_gonder(self.master, 2, 1490)
-                pwm_gonder(self.master, 3, 1900)
-                pwm_gonder(self.master, 4, 1490)
-                return "SOLA DON"
-
-        return "VIRAJ TESPIT EDILEMEDI"
-
-    # 🔧 DÜZ ÇİZGİ FONKSİYONU - AÇI DÜZELTMESİ DÜZELTİLDİ
-    def duz_cizgi_fonksiyonu(self, regions, angle=None, line_center=None):
-        sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-
-        # 1. ANA DÜZ ÇİZGİ KONTROLÜ (EN YÜKSEK ÖNCELİK)
-        if orta_alt > 1000 and orta_ust > 1000:
-            # 🔧 AÇI DÜZELTMESİ ŞARTINI DÜZELTTİM
-            # Açı düzeltmesi yapılabilir koşulları:
-            # a) Yan taraflarda çok güçlü çizgi yok
-            # b) Açı belirsizliği var
-
-            yan_cizgi_zayif = (sol_ust < 1500 and sag_ust < 1500 and sol_alt < 1500 and sag_alt < 1500)
-
-            if yan_cizgi_zayif and self.is_line_angled(angle):
-                if angle < -self.angle_correction_threshold:
-                    print(f"🔄 saga don (açı düzeltmesi: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1490)
-                    pwm_gonder(self.master, 2, 1650)
-                    pwm_gonder(self.master, 3, 1490)
-                    pwm_gonder(self.master, 4, 1650)
-                    return "SAGA DON (AÇI DÜZELTMESİ)"
-                elif angle > self.angle_correction_threshold:
-                    print(f"🔄 sola don (açı düzeltmesi: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1700)
-                    pwm_gonder(self.master, 2, 1490)
-                    pwm_gonder(self.master, 3, 1700)
-                    pwm_gonder(self.master, 4, 1490)
-                    return "SOLA DON (AÇI DÜZELTMESİ)"
-
-            print("🔄 duz git (orta güçlü)")
-            pwm_gonder(self.master, 1, 1730)
-            pwm_gonder(self.master, 2, 1700)
-            pwm_gonder(self.master, 3, 1730)
-            pwm_gonder(self.master, 4, 1700)
-            return "DUZ GIT"
-
-        # 2. YENGEÇ HAREKETLERİ (HEM ÜST HEM ALT)
-        if sag_ust > 1000 and sag_alt > 1000:
-            print("🔄 sag yengec (üst+alt)")
-            pwm_gonder(self.master, 1, 1220)
-            pwm_gonder(self.master, 2, 1750)
-            pwm_gonder(self.master, 3, 1780)
-            pwm_gonder(self.master, 4, 1250)
-            return "SAG YENGEC"
-        if sol_ust > 1000 and sol_alt > 1000:
-            print("🔄 sol yengec (üst+alt)")
-            pwm_gonder(self.master, 1, 1780)
-            pwm_gonder(self.master, 2, 1250)
-            pwm_gonder(self.master, 3, 1220)
-            pwm_gonder(self.master, 4, 1750)
-            return "SOL YENGEC"
-
-        # 3. SADECE ÜST BÖLGE YENGEÇLERİ - AÇI DÜZELTMESİ EKLENDİ
-        if sag_ust > 1000 and orta_ust <= 1000 and sol_ust <= 1000:
-            # 🔧 AÇI DÜZELTMESİ YENGEC İÇİN DE EKLENDİ
-            if self.is_line_angled(angle):
-                if angle < -self.angle_correction_threshold:
-                    print(f"🔄 saga don (sag yengec + açı düzeltmesi: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1400)  # Daha agresif açı düzeltmesi
-                    pwm_gonder(self.master, 2, 1750)
-                    pwm_gonder(self.master, 3, 1780)
-                    pwm_gonder(self.master, 4, 1400)
-                    return "SAG YENGEC + AÇI DÜZELTMESİ"
-                elif angle > self.angle_correction_threshold:
-                    print(f"🔄 sola don (sag yengec ama açı solda: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1650)
-                    pwm_gonder(self.master, 2, 1400)
-                    pwm_gonder(self.master, 3, 1400)
-                    pwm_gonder(self.master, 4, 1650)
-                    return "SAG YENGEC + SOLA AÇI DÜZELTMESİ"
-
-            print("🔄 sag yengec (sadece üst)")
-            pwm_gonder(self.master, 1, 1220)
-            pwm_gonder(self.master, 2, 1750)
-            pwm_gonder(self.master, 3, 1780)
-            pwm_gonder(self.master, 4, 1250)
-            return "SAG YENGEC"
-
-        if sol_ust > 1000 and orta_ust <= 1000 and sag_ust <= 1000:
-            # 🔧 AÇI DÜZELTMESİ SOL YENGEC İÇİN DE EKLENDİ
-            if self.is_line_angled(angle):
-                if angle > self.angle_correction_threshold:
-                    print(f"🔄 sola don (sol yengec + açı düzeltmesi: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1780)
-                    pwm_gonder(self.master, 2, 1400)  # Daha agresif açı düzeltmesi
-                    pwm_gonder(self.master, 3, 1400)
-                    pwm_gonder(self.master, 4, 1750)
-                    return "SOL YENGEC + AÇI DÜZELTMESİ"
-                elif angle < -self.angle_correction_threshold:
-                    print(f"🔄 saga don (sol yengec ama açı sağda: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1400)
-                    pwm_gonder(self.master, 2, 1650)
-                    pwm_gonder(self.master, 3, 1650)
-                    pwm_gonder(self.master, 4, 1400)
-                    return "SOL YENGEC + SAGA AÇI DÜZELTMESİ"
-
-            print("🔄 sol yengec (sadece üst)")
-            pwm_gonder(self.master, 1, 1780)
-            pwm_gonder(self.master, 2, 1250)
-            pwm_gonder(self.master, 3, 1220)
-            pwm_gonder(self.master, 4, 1750)
-            return "SOL YENGEC"
-
-        # 4. SADECE ORTA ÜST - GELİŞTİRİLMİŞ AÇI DÜZELTMESİ
-        if orta_ust > 1000 and sol_ust <= 1000 and sag_ust <= 1000:
-            if self.is_line_angled(angle):
-                if angle < -self.angle_correction_threshold:
-                    print(f"🔄 saga don (açı düzeltmesi - sadece orta üst: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1470)
-                    pwm_gonder(self.master, 2, 1650)
-                    pwm_gonder(self.master, 3, 1470)
-                    pwm_gonder(self.master, 4, 1650)
-                    return "SAGA DON (AÇI DÜZELTMESİ)"
-                elif angle > self.angle_correction_threshold:
-                    print(f"🔄 sola don (açı düzeltmesi - sadece orta üst: {angle:.1f}°)")
-                    pwm_gonder(self.master, 1, 1650)
-                    pwm_gonder(self.master, 2, 1470)
-                    pwm_gonder(self.master, 3, 1650)
-                    pwm_gonder(self.master, 4, 1470)
-                    return "SOLA DON (AÇI DÜZELTMESİ)"
-            print("🔄 duz git (sadece orta üst)")
-            pwm_gonder(self.master, 1, 1730)
-            pwm_gonder(self.master, 2, 1700)
-            pwm_gonder(self.master, 3, 1730)
-            pwm_gonder(self.master, 4, 1700)
-            return "DUZ GIT"
-
-        # 5. SADECE ORTA ALT
-        if orta_alt > 1000:
-            print("🔄 geri git (sadece orta alt)")
-            pwm_gonder(self.master, 1, 1400)
-            pwm_gonder(self.master, 2, 1400)
-            pwm_gonder(self.master, 3, 1400)
-            pwm_gonder(self.master, 4, 1400)
-            return "GERİ GİT"
-
-        # 6. DİĞER DURUMLAR
-        return "DUZ ÇİZGİ BELİRSİZ"
-
-    # 🔧 DRAW INFO - OPTIMIZE EDİLDİ
-    def draw_info(self, frame, mod, hareket, angle, regions, cizgi_mevcut, anomalies=None):
-        """Bilgileri çiz - OPTIMIZE"""
-        try:
-            # Başlangıç durumu göstergesi
-            if not self.algoritma_aktif:
-                gecen_sure = time.time() - self.baslangic_zamani if self.baslangic_zamani else 0
-                kalan_sure = max(0, self.baslangic_suresi - gecen_sure)
-                cv2.putText(frame, f"BASLANGIC MODU - KALAN: {kalan_sure:.1f}s",
-                            (10, self.height - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.rectangle(frame, (2, 2), (self.width - 2, self.height - 2), (0, 255, 255), 4)
-
-            # Temel bilgiler - daha kompakt
-            info_y = 25
-            cv2.putText(frame, f"FPS: {self.fps:.1f}", (self.width - 100, info_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            cv2.putText(frame, f"Mod: {mod}", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-            info_y += 25
-            cv2.putText(frame, f"Hareket: {hareket}", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-            info_y += 25
-            aci_bilgisi = f"Açı: {angle:.1f}°" if angle is not None else "Açı: --"
-            cv2.putText(frame, aci_bilgisi, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-
-            info_y += 25
-            cv2.putText(frame, f"Cizgi: {'VAR' if cizgi_mevcut else 'YOK'}", (10, info_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if cizgi_mevcut else (0, 0, 255), 1)
-
-            # 🔧 K-means ve YOLO durumu - OPTIMIZE
-            info_y += 25
-            kmeans_status = f"K-means: {self.kmeans_counter % self.kmeans_interval}/{self.kmeans_interval}" if self.use_kmeans else "K-means: OFF"
-            cv2.putText(frame, kmeans_status, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                        (0, 255, 0) if self.use_kmeans else (0, 0, 255), 1)
-
-            # YOLO bilgisi - OPTIMIZE
-            info_y += 20
-            if self.yolo_model is not None:
-                yolo_status = f"YOLO: {self.yolo_frame_counter % self.yolo_frame_interval}/{self.yolo_frame_interval} | {self.anomaly_count} total"
-                cv2.putText(frame, yolo_status, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 100, 0), 1)
-
-                # Aktif anomaliler
-                if anomalies and len(anomalies) > 0:
-                    info_y += 20
-                    cv2.putText(frame, f"AKTIF: {len(anomalies)} ANOMALİ!", (10, info_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-            # Bölgeler - daha kompakt
-            info_y += 25
-            sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
-            region_text = f"U[{sol_ust},{orta_ust},{sag_ust}] A[{sol_alt},{orta_alt},{sag_alt}]"
-            cv2.putText(frame, region_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-            # Son yön bilgisi
-            info_y += 20
-            cv2.putText(frame, f"Son Yön: {self.son_cizgi_yonu} | Kayıp: {self.cizgi_kayip_sayaci}",
-                        (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-
-            # Bölge çizgileri - daha ince
-            rw = int(self.region_width * self.scale_factor)
-            rh = int(self.region_height * self.scale_factor)
-            cv2.line(frame, (rw, 0), (rw, self.height), (0, 255, 0), 1)
-            cv2.line(frame, (rw * 2, 0), (rw * 2, self.height), (0, 255, 0), 1)
-            cv2.line(frame, (0, rh), (self.width, rh), (0, 255, 0), 1)
-
-            # Merkez çizgisi
-            cv2.line(frame, (self.width // 2, 0), (self.width // 2, self.height), (255, 0, 0), 1)
-
-            # Mod çerçevesi
-            if mod == "ARAMA MODU":
-                cv2.rectangle(frame, (2, 2), (self.width - 2, self.height - 2), (0, 0, 255), 3)
-            elif "VIRAJ" in mod:
-                cv2.rectangle(frame, (2, 2), (self.width - 2, self.height - 2), (255, 0, 0), 3)
-            elif "YENGEC" in hareket:
-                cv2.rectangle(frame, (2, 2), (self.width - 2, self.height - 2), (0, 255, 255), 3)
-            elif anomalies and len(anomalies) > 0:
-                cv2.rectangle(frame, (2, 2), (self.width - 2, self.height - 2), (255, 0, 255), 4)
-
-        except:
-            pass
-
-    # 🔧 ANA DÖNGÜ - OPTIMİZE EDİLDİ
     def run(self):
-        """Ana döngü - ULTRA OPTIMIZE"""
-        print("*** ÇİZGİ TAKİBİ + YOLO ANOMALİ TESPİTİ - ULTRA OPTIMIZE ***")
-        print("🚀 PERFORMANCE OPTIMIZATIONS:")
-        print(f"   📷 İşleme boyutu: {self.process_width}px (küçültüldü)")
-        print(f"   🧠 K-means interval: {self.kmeans_interval} frame")
-        print(f"   🎯 YOLO interval: {self.yolo_frame_interval} frame")
-        print(f"   ⚡ Açı düzeltme eşiği: {self.angle_correction_threshold}°")
-        print("🌊 İLK 1 SANİYE DÜZ İLERİ GİDECEK, SONRA ALGORİTMA ÇALIŞACAK")
-
-        # YOLO durumu
-        if self.yolo_model:
-            print(f"✅ YOLO AKTİF - Her {self.yolo_frame_interval} frame'de çalışacak")
-            print(f"📝 Log dosyası: {self.anomaly_log_file}")
-            if hasattr(self.yolo_model, 'names'):
-                print(f"🎯 Tespit sınıfları: {list(self.yolo_model.names.values())}")
-        else:
-            print("❌ YOLO modeli yok - Sadece çizgi takibi")
-
-        print("Çıkmak için 'q', Duraklatmak için 'SPACE', Sıfırlamak için 'r'")
-
-        # Kamera kontrolü
-        if self.cap is None or not self.cap.isOpened():
-            print("❌ Kamera başlatılamadı!")
-            return
+        """Ana döngü - BİRİNCİ KODDAKI MÜKEMMEL ALGORİTMA + YOLO + IMU"""
+        print("*** ÇİZGİ TAKİBİ - VİRAJ SORUN ÇÖZÜLMÜŞ VERSİYON + YOLO + IMU ***")
+        print("BİRİNCİ KODDAKI SUPERIOR ALGORİTMA AKTİF!")
+        print("YOLO ANOMALİ TESPİTİ AKTİF!" if self.yolo_model else "YOLO YOK - SADECE ÇİZGİ TAKİBİ")
+        print("IMU DESTEKLİ DERİNLİK VE PITCH KONTROLÜ AKTİF!" if IMU_AVAILABLE and imu else "IMU YOK")
+        print("Çıkmak için 'q' tuşuna basın")
+        print("Duraklatmak için 'SPACE' tuşuna basın")
+        print("Sıfırlamak için 'r' tuşuna basın")
 
         paused = False
-        frame_count = 0
-        last_fps_time = time.time()
-
-        # Başlangıç zamanı
-        self.baslangic_zamani = time.time()
-        print(f"🚀 BAŞLANGIC: {self.baslangic_suresi} saniye düz gidecek...")
 
         while True:
             if not paused:
                 ret, frame = self.cap.read()
                 if not ret:
-                    print("Video bitti!")
+                    print("Video bitti veya okuma hatası!")
                     break
 
-                frame_count += 1
-                current_time = time.time()
+                # FPS hesaplama
+                curr_time = time.time()
+                self.fps = 1 / (curr_time - self.prev_time)
+                self.prev_time = curr_time
 
-                # FPS hesapla (her 30 frame'de)
-                if frame_count % 30 == 0:
-                    if current_time - last_fps_time > 0:
-                        self.fps = 30 / (current_time - last_fps_time)
-                    last_fps_time = current_time
-
-                # BAŞLANGIÇ KONTROL MANTIGI
-                if not self.algoritma_aktif:
-                    gecen_sure = current_time - self.baslangic_zamani
-
-                    if gecen_sure >= self.baslangic_suresi:
-                        self.algoritma_aktif = True
-                        print(f"✅ BAŞLANGIÇ TAMAMLANDI! Algoritma aktif. ({gecen_sure:.1f}s)")
-                    else:
-                        # Başlangıç modu - sadece düz git
-                        kalan_sure = self.baslangic_suresi - gecen_sure
-                        hareket = "DUZ GIT (BAŞLANGIÇ)"
-                        mod = "BAŞLANGIÇ MODU"
-
-                        # Başlangıçta da YOLO çalışabilir (daha az sıklıkta)
-                        anomalies = []
-                        if self.yolo_model is not None:
-                            anomalies, frame = self.detect_anomalies(frame)
-                            if anomalies:
-                                mod += " + ANOMALİ"
-
-                        angle = None
-                        regions = [0, 0, 0, 0, 0, 0]
-                        cizgi_mevcut = False
-
-                        # Görselleştirme
-                        self.draw_info(frame, mod, hareket, angle, regions, cizgi_mevcut, anomalies)
-                        cv2.imshow('Cizgi Takibi + YOLO Anomali', frame)
-
-                        # Konsol çıktısı (her 30 frame'de)
-                        if frame_count % 30 == 0:
-                            anomali_info = f" | {len(anomalies)} anomali" if anomalies else ""
-                            print(f"🌊 BAŞLANGIÇ: Kalan {kalan_sure:.1f}s{anomali_info}")
-
-                        # Tuş kontrol ve devam
-                        key = cv2.waitKey(1) & 0xFF
-                        if key == ord('q'):
-                            break
-                        elif key == ord(' '):
-                            paused = not paused
-                        elif key == ord('a'):
-                            self.algoritma_aktif = True
-                            print("🚀 ALGORİTMA MANUEL BAŞLATILDI!")
-                        elif key == ord('r'):
-                            self.cizgi_kayip_sayaci = 0
-                            self.son_cizgi_yonu = "ORTA"
-                            self.algoritma_aktif = False
-                            self.baslangic_zamani = time.time()
-                            print("🔄 Sistem sıfırlandı")
-                        continue
-
-                # ALGORİTMA AKTİF - ANA İŞLEME
-                # YOLO anomali tespiti (optimize edilmiş interval)
+                # YOLO anomali tespiti
                 anomalies = []
                 if self.yolo_model is not None:
                     anomalies, frame = self.detect_anomalies(frame)
 
-                # Görüntü işleme (optimize edilmiş)
+                # Ön işleme - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM
                 gray, thresh, small_frame = self.preprocess_frame(frame)
+
+                # Çizgi tespiti - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM
                 angle, center, lines = self.detect_line_angle(thresh)
                 regions, _ = self.detect_line_position(thresh)
 
-                # Çizgi kontrolü
-                cizgi_mevcut = self.cizgi_var_mi(regions)
+                # ANA KARAR VERME - BİRİNCİ KODDAKI MÜKEMMEL ALGORİTMA
+                hareket, mod = self.ana_karar_verici(regions, angle, center)
 
-                # Hareket karar algoritması
-                if cizgi_mevcut:
-                    self.cizgi_kayip_sayaci = 0
-                    self.son_cizgi_yonunu_guncelle(regions)
+                # Hareketi uygula
+                self.execute_movement(hareket)
 
-                    is_viraj = self.viraj_tespiti(regions)
+                # Debug bilgileri - BİRİNCİ KODDAN
+                ratios = self.calculate_ratios(regions)
 
-                    if is_viraj:
-                        hareket = self.viraj_fonksiyonu(regions)  # Feedback mekanizmalı
-                        mod = "VIRAJ MODU"
-                    else:
-                        hareket = self.duz_cizgi_fonksiyonu(regions, angle, center)  # Düzeltilmiş açı kontrolü
-                        mod = "DUZ CIZGI MODU"
-                else:
-                    self.cizgi_kayip_sayaci += 1
+                # Görselleştirme - BİRİNCİ KODDAKI MÜKEMMEL YÖNTEM
+                frame = self.draw_regions(frame)
+                frame = self.draw_detected_line(frame, lines, center, angle)
 
-                    if self.cizgi_kayip_sayaci >= self.kayip_esigi:
-                        hareket = self.arama_modu_karar()
-                        mod = "ARAMA MODU"
-                    else:
-                        hareket = "BEKLE"
-                        mod = "BEKLE MODU"
+                # Bilgileri formatla
+                sol_ust, orta_ust, sag_ust, sol_alt, orta_alt, sag_alt = regions
+                bolge_bilgisi = f"U:[{sol_ust},{orta_ust},{sag_ust}] A:[{sol_alt},{orta_alt},{sag_alt}]"
+                aci_bilgisi = f"Açı: {angle:.1f}°" if angle is not None else "Açı: Tespit edilemedi"
 
-                # Anomali durumunda mod güncelle
-                if anomalies:
-                    mod += " + ANOMALİ"
+                # VİRAJ MODU BİLGİLERİ - BİRİNCİ KODDAN
+                viraj_durum = f"Viraj Aktif: {self.viraj_modu_aktif} | Süre: {self.viraj_modu_suresi}"
 
-                # Görselleştirme
-                self.draw_info(frame, mod, hareket, angle, regions, cizgi_mevcut, anomalies)
+                # Anomali bilgileri
+                anomali_bilgisi = f"YOLO: {len(anomalies)} aktif | {self.anomaly_count} toplam" if self.yolo_model else "YOLO: YOK"
 
-                # Tespit edilen çizgileri çiz
-                if lines:
-                    for line in lines:
-                        x1, y1, x2, y2 = [int(x * self.scale_factor) for x in line]
-                        cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                # Ekrana yazdır
+                cv2.putText(frame, f"FPS: {self.fps:.1f}", (self.width - 100, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(frame, f"Mod: {mod}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, f"Hareket: {hareket}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(frame, aci_bilgisi, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                cv2.putText(frame, bolge_bilgisi, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.putText(frame, viraj_durum, (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(frame, anomali_bilgisi, (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 1)
+
+                cv2.putText(frame, f"Son Yön: {self.son_cizgi_yonu} | Kayıp: {self.cizgi_kayip_sayaci}",
+                            (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                if paused:
+                    cv2.putText(frame, "DURAKLATILDI - SPACE ile devam et", (10, 270),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                # Mod çerçeveleri - BİRİNCİ KODDAN
+                if self.viraj_modu_aktif:
+                    cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (0, 0, 255), 8)  # Kalın kırmızı
+                elif mod == "ARAMA MODU":
+                    cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 0, 0), 5)
+                elif "AÇI DÜZELTMESİ" in mod:
+                    cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (0, 255, 255), 3)
+                elif anomalies:
+                    cv2.rectangle(frame, (5, 5), (self.width - 5, self.height - 5), (255, 0, 255), 4)
 
                 # Görüntüleri göster
-                cv2.imshow('Cizgi Takibi + YOLO Anomali', frame)
-
-                # Threshold küçük boyutta (performans için)
-                if frame_count % 5 == 0 and thresh is not None:  # Her 5 frame'de bir göster
-                    small_thresh = cv2.resize(thresh, (240, 180))  # Daha küçük
-                    cv2.imshow('Threshold', small_thresh)
-
-                # Konsol çıktısı (daha az sıklıkta)
-                if frame_count % 90 == 0:  # 60'tan 90'a çıkardım
-                    print(f"📊 Frame: {frame_count}, FPS: {self.fps:.1f}")
-                    print(f"    Mod: {mod}, Hareket: {hareket}")
-                    if self.yolo_model:
-                        active_anomalies = len(anomalies) if anomalies else 0
-                        print(f"    YOLO: {active_anomalies} aktif, {self.anomaly_count} toplam tespit")
+                cv2.imshow('Cizgi Takibi + YOLO + IMU - Superior Algoritma', frame)
+                cv2.imshow('Threshold', cv2.resize(thresh, (320, 240)))
 
             # Tuş kontrolü
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
-                print("🛑 Çıkış")
                 break
             elif key == ord(' '):
                 paused = not paused
-                print("⏸ Duraklatıldı" if paused else "▶ Devam")
+                print("Duraklatıldı" if paused else "Devam ediyor")
             elif key == ord('r'):
                 self.cizgi_kayip_sayaci = 0
                 self.son_cizgi_yonu = "ORTA"
-                self.algoritma_aktif = False
-                self.baslangic_zamani = time.time()
-                print("🔄 Sistem sıfırlandı")
-            elif key == ord('k'):
-                self.use_kmeans = not self.use_kmeans
-                print(f"🔧 K-means {'AKTİF' if self.use_kmeans else 'PASİF'}")
-            elif key == ord('i'):
-                self.kmeans_interval = 10 if self.kmeans_interval == 15 else 15
-                print(f"🔧 K-means interval: {self.kmeans_interval}")
-            elif key == ord('y'):  # YOLO interval ayarı
-                self.yolo_frame_interval = 10 if self.yolo_frame_interval == 20 else 20
-                print(f"🔧 YOLO interval: {self.yolo_frame_interval}")
-            elif key == ord('a'):
-                if not self.algoritma_aktif:
-                    self.algoritma_aktif = True
-                    print("🚀 ALGORİTMA MANUEL BAŞLATILDI!")
+                self.current_state = "NORMAL"
+                self.state_counter = 0
+                self.viraj_modu_aktif = False
+                self.viraj_modu_suresi = 0
+                self.viraj_cikis_esigi = 3
+                print("Sistem sıfırlandı")
 
         # Temizlik
         self.cap.release()
@@ -1258,8 +1141,8 @@ class LineFollowingAlgorithm:
                     f.write(f"TOPLAM TESPİT: {self.anomaly_count}\n")
                     f.write(f"PROGRAM BİTİŞ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write(f"FPS PERFORMANSI: {self.fps:.1f}\n")
-                print(f"📝 Log tamamlandı: {self.anomaly_count} tespit, FPS: {self.fps:.1f}")
-                print(f"📁 Log: {self.anomaly_log_file}")
+                print(f"Log tamamlandı: {self.anomaly_count} tespit, FPS: {self.fps:.1f}")
+                print(f"Log: {self.anomaly_log_file}")
             except:
                 pass
 
@@ -1271,13 +1154,42 @@ class LineFollowingAlgorithm:
 
 def main():
     """Ana fonksiyon"""
-    global shutdown_flag, depth_control_active
+    global shutdown_flag, depth_control_active, imu
 
     algorithm = None
     master = None
 
     try:
         print("🔧 Jetson Nano sistemi başlatılıyor...")
+
+        # IMU başlatma
+        if IMU_AVAILABLE:
+            print("📡 IMU başlatılıyor...")
+            try:
+                imu = BNO055.BNO055(serial_port=SERIAL_IMU)
+                if imu.begin():
+                    time.sleep(2)
+                    print("✅ IMU hazır")
+
+                    # Referans pitch kontrolü
+                    ref_pitch = referans_oku()
+                    if ref_pitch is None:
+                        print("⚠ Referans pitch bulunamadı, otomatik referans alınıyor...")
+                        try:
+                            referans_kaydet()
+                        except Exception as e:
+                            print(f"❌ Referans pitch kayıt hatası: {e}")
+                    else:
+                        print(f"📐 Mevcut referans pitch: {ref_pitch:.1f}°")
+                else:
+                    print("❌ IMU başlatılamadı")
+                    imu = None
+            except Exception as e:
+                print(f"❌ IMU hatası: {e}")
+                imu = None
+        else:
+            print("⚠ IMU kütüphanesi yok")
+            imu = None
 
         # Pixhawk bağlantısı
         print("🚁 Pixhawk bağlantısı deneniyor...")
@@ -1287,11 +1199,11 @@ def main():
             arm_motors(master)
             time.sleep(1)
 
-            # Derinlik kontrol başlat
+            # Derinlik ve pitch kontrol başlat
             depth_thread = threading.Thread(target=depth_control_thread, args=(master,))
             depth_thread.daemon = True
             depth_thread.start()
-            print("🌊 Derinlik kontrol başlatıldı")
+            print("🌊 IMU destekli derinlik ve pitch kontrol başlatıldı")
         else:
             print("⚠ Pixhawk bağlanamadı, sadece kamera modu")
 
@@ -1299,8 +1211,7 @@ def main():
         possible_paths = [
             "best.pt",
             "./best.pt",
-            "/home/kubra/modellıdenenecekler/best.pt",
-            "/home/kubra/İndirilenler/best.pt",
+            "/home/nova/Downloads/best.pt",
             "models/best.pt"
         ]
 
@@ -1311,8 +1222,8 @@ def main():
                 print(f"✅ Model bulundu: {path}")
                 break
 
-        # Algoritma başlat
-        print("🚀 ULTRA OPTIMIZE algoritma başlatılıyor...")
+        # Algoritma başlat - BİRİNCİ KODDAKI SUPERIOR ALGORİTMA İLE
+        print("🚀 BİRİNCİ KODDAKI SUPERIOR ALGORİTMA + YOLO + IMU AKTİF!")
         algorithm = LineFollowingAlgorithm(model_path=model_path)
         algorithm.set_master(master)
 
@@ -1336,7 +1247,7 @@ def main():
 
         if master:
             try:
-                stop_motors(master)
+                tum_motorlari_durdur(master)
                 print("🔴 Motorlar durduruldu")
             except Exception as e:
                 print(f"Motor durdurma hatası: {e}")
@@ -1350,5 +1261,5 @@ def main():
         print("✅ Program güvenli şekilde sonlandı")
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
