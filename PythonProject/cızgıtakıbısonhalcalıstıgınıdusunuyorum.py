@@ -392,7 +392,7 @@ def depth_control_thread(master):
 
 
 class LineFollowingAlgorithm:
-    def _init_(self, video_path=None, model_path="best.pt"):
+    def __init__(self, video_path=None, model_path="best.pt"):
         if video_path:
             self.cap = cv2.VideoCapture(video_path)
         else:
@@ -412,7 +412,7 @@ class LineFollowingAlgorithm:
         self.scale_factor = self.width / self.process_width
 
         # Ayarlanabilir bölge genişlikleri - BİRİNCİ KODDAKI SUPERIOR BÖLGE AYARLARI
-        self.region_ratios = [0.35, 0.30, 0.35]  # Sol, Orta, Sağ oranları
+        self.region_ratios = [0.30, 0.40, 0.30]  # Sol, Orta, Sağ oranları
         self.region_widths = [
             int(self.process_width * self.region_ratios[0]),  # Sol genişlik
             int(self.process_width * self.region_ratios[1]),  # Orta genişlik
@@ -463,7 +463,7 @@ class LineFollowingAlgorithm:
         self.model_path = model_path
         self.anomaly_count = 0
         self.last_anomaly_time = 0
-        self.yolo_frame_interval = 50  # 20 frame'de bir çalıştır
+        self.yolo_frame_interval = 30  # 20 frame'de bir çalıştır
         self.yolo_frame_counter = 0
         self.last_anomaly_detections = []  # Son tespit edilen anomaliler
         self.anomaly_cooldown = {}  # Her anomali türü için cooldown
@@ -1030,6 +1030,22 @@ class LineFollowingAlgorithm:
         print("Çıkmak için 'q' tuşuna basın")
         print("Duraklatmak için 'SPACE' tuşuna basın")
         print("Sıfırlamak için 'r' tuşuna basın")
+
+        # *** İLK BAŞTA 1 SANİYE İLERİ GİT ***
+        print("\n🚀 İLK BAŞTA 1 SANİYE İLERİ GİDİLİYOR - DALGA ETKİSİNİ YENEBİLMEK İÇİN...")
+        if self.master is not None:
+            ileri_git_baslangic = time.time()
+            while time.time() - ileri_git_baslangic < 1.4:  # 1.4 saniye
+                # Düz ileri git komutu
+                pwm_gonder(self.master, 1, 1615)
+                pwm_gonder(self.master, 2, 1600)
+                pwm_gonder(self.master, 3, 1615)
+                pwm_gonder(self.master, 4, 1600)
+                print(f"⏰ İleri hareket: {1.4 - (time.time() - ileri_git_baslangic):.1f}s kaldı")
+                time.sleep(0.1)
+            print("✅ İlk hareket tamamlandı! Şimdi çizgi takibine geçiliyor...\n")
+        else:
+            print("⚠ Pixhawk bağlantısı yok, ilk hareket atlanıyor...\n")
 
         paused = False
 
